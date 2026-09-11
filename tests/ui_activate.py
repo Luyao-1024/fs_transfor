@@ -149,6 +149,7 @@ def main():
                 # 菜单为自绘 Popover+ListBox: 从行部件收集标签
                 lbls = [x.get_text() for x in walk(win.left._menu_popover)
                         if isinstance(x, Gtk.Label) and x.get_text()]
+                check(lbls[0] == "刷新", "右键菜单将常用的刷新放在首位")
                 check("删除" not in lbls and "传输到对侧" not in lbls,
                       "空白区域菜单不显示文件专属操作")
                 check("新建文件夹" in lbls and "刷新" in lbls,

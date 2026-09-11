@@ -21,6 +21,8 @@
   不支持回收站的位置会询问后永久删除; 远程删除前确认(永久);
   Delete 键 / 右键菜单均可
 - **配置记忆**: 保存的服务器一键连接(含复用); `~/.ssh/config` 主机一键填充; 会话自动恢复
+- **路径收藏**: 路径栏旁可命名、收藏、跳转或删除常用目录；本地收藏独立保存，
+  SSH 收藏按主机、端口和用户名分组，同一服务器跨标签共享
 - **传输提示**: 每条传输实时速度/进度/取消, 顶栏总速度, Toast 提示
 - **原生右键菜单**: 在点击位置展开，可超出应用窗口，在屏幕边缘自动避让；
   打开菜单时保留主界面，鼠标单击和键盘激活均可执行操作，分隔线紧凑
@@ -93,6 +95,7 @@ sudo dnf install rpm-build
 .venv/bin/python tests/ui_delete_perm.py # 窗口: 本地删除对话框(回收站/直接删除/取消)
 .venv/bin/python tests/ui_menu.py        # 窗口: 原生菜单定位/跨窗口/屏幕避让/鼠标与键盘激活
 .venv/bin/python tests/ui_suspend.py     # 窗口: 连接暂停/恢复/断线保留文件界面
+.venv/bin/python tests/ui_bookmarks.py   # 窗口: 本地/SSH 路径收藏分组与持久化
 ```
 
 测试通过 `FSTRANSFOR_CONFIG_HOME` 环境变量隔离配置目录, 不会读写真实会话;

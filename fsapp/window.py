@@ -306,6 +306,12 @@ class MainWindow(Adw.ApplicationWindow):
     def on_pane_path_changed(self, pane):
         self._save_session()
 
+    def on_bookmarks_changed(self):
+        for ws in self.workspaces:
+            ws.left._sync_bookmark_button()
+            ws.right._sync_bookmark_button()
+        self._save_session()
+
     @staticmethod
     def _pane_state(pane):
         if pane.server_cfg:

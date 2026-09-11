@@ -93,6 +93,13 @@ class FilePane(Gtk.Box):
         self.path_entry.connect("icon-press", self._on_entry_icon_press)
         bar.append(self.path_entry)
 
+        self.bookmark_btn = Gtk.MenuButton(icon_name="non-starred-symbolic")
+        self.bookmark_btn.set_tooltip_text("路径收藏")
+        bookmark_popover = Gtk.Popover()
+        bookmark_popover.connect("show", self._rebuild_bookmark_popover)
+        self.bookmark_btn.set_popover(bookmark_popover)
+        bar.append(self.bookmark_btn)
+
         up = Gtk.Button(icon_name="go-previous-symbolic")
         up.set_tooltip_text("上一级目录")
         up.connect("clicked", lambda *_: self.navigate(self.backend.parent(self.cwd)))
@@ -376,6 +383,7 @@ class FilePane(Gtk.Box):
         self.path_entry.set_text(path)
         self.cwd = path
         self.empty_revealer.set_reveal_child(not items)
+        self._sync_bookmark_button()
         self.window.on_pane_path_changed(self)
         return False
 
@@ -532,8 +540,162 @@ class FilePane(Gtk.Box):
             self.connect_btn.set_label("连接")
         sensitive = state == "files" and not self.suspended
         self.path_entry.set_sensitive(sensitive)
+        self.bookmark_btn.set_sensitive(sensitive)
         self.up_btn.set_sensitive(sensitive)
         self.home_btn.set_sensitive(sensitive)
+        self._sync_bookmark_button()
+
+    # ---- 路径收藏 ----
+    def _bookmark_entries(self):
+        return config.bookmark_entries(self.window.settings, self.server_cfg)
+
+    def _bookmark_paths(self):
+        return [entry["path"] for entry in self._bookmark_entries()]
+
+    def _current_path_is_bookmarked(self):
+        path = self.backend.normpath(self.cwd)
+        return path in self._bookmark_paths()
+
+    def _sync_bookmark_button(self):
+        saved = self._current_path_is_bookmarked()
+        self.bookmark_btn.set_icon_name(
+            "starred-symbolic" if saved else "non-starred-symbolic")
+        self.bookmark_btn.set_tooltip_text(
+            "当前路径已收藏" if saved else "路径收藏")
+
+    def _set_current_bookmarked(self, enabled: bool, name: str | None = None):
+        path = self.backend.normpath(self.cwd)
+        entries = self._bookmark_entries()
+        entry = next((item for item in entries if item["path"] == path), None)
+        changed = False
+        if enabled and entry is None:
+            display_name = (name or self.backend.basename(path) or path).strip()
+            entries.append({"path": path, "name": display_name})
+            changed = True
+        elif enabled and name and entry["name"] != name.strip():
+            entry["name"] = name.strip()
+            changed = True
+        elif not enabled and entry is not None:
+            entries.remove(entry)
+            changed = True
+        if not changed:
+            return
+        config.set_bookmark_entries(self.window.settings, self.server_cfg, entries)
+        self._sync_bookmark_button()
+        self.window.on_bookmarks_changed()
+        self.window.toast("已收藏当前路径" if enabled else "已取消路径收藏")
+
+    def _remove_bookmark(self, path: str):
+        entries = self._bookmark_entries()
+        remaining = [entry for entry in entries if entry["path"] != path]
+        if len(remaining) == len(entries):
+            return
+        config.set_bookmark_entries(self.window.settings, self.server_cfg, remaining)
+        self._sync_bookmark_button()
+        self.window.on_bookmarks_changed()
+
+    def _prompt_current_bookmark(self):
+        path = self.backend.normpath(self.cwd)
+        initial = self.backend.basename(path) or path
+        TextPromptDialog(
+            self.window,
+            lambda name: self._set_current_bookmarked(True, name) if name else None,
+            "收藏名称", initial=initial, ok_label="收藏")
+
+    def _rename_bookmark(self, path: str, name: str | None):
+        if not name:
+            return
+        entries = self._bookmark_entries()
+        for entry in entries:
+            if entry["path"] == path:
+                entry["name"] = name.strip()
+                config.set_bookmark_entries(
+                    self.window.settings, self.server_cfg, entries)
+                self.window.on_bookmarks_changed()
+                return
+
+    def _prompt_rename_bookmark(self, entry: dict):
+        path = entry["path"]
+        initial = entry["name"] or self.backend.basename(path) or path
+        TextPromptDialog(
+            self.window, lambda name: self._rename_bookmark(path, name),
+            "重命名收藏", initial=initial, ok_label="保存")
+
+    def _rebuild_bookmark_popover(self, *args):
+        popover = self.bookmark_btn.get_popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for margin in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{margin}")(12)
+        box.set_size_request(340, -1)
+
+        scope = "本地收藏"
+        if self.server_cfg is not None:
+            name = self.server_cfg.get("name") or self.backend.label
+            scope = f"{name} 的收藏"
+        header = Gtk.Box(spacing=6)
+        title = Gtk.Label(label=scope, xalign=0, hexpand=True)
+        title.add_css_class("heading")
+        header.append(title)
+
+        saved = self._current_path_is_bookmarked()
+        toggle = Gtk.Button(icon_name=("starred-symbolic" if saved
+                                       else "non-starred-symbolic"))
+        toggle.add_css_class("flat")
+        toggle.set_tooltip_text("取消收藏当前路径" if saved
+                                else "收藏当前路径")
+        if saved:
+            toggle.connect("clicked", lambda *_: (
+                popover.popdown(), self._set_current_bookmarked(False)))
+        else:
+            toggle.connect("clicked", lambda *_: (
+                popover.popdown(), self._prompt_current_bookmark()))
+        header.append(toggle)
+        box.append(header)
+
+        entries = self._bookmark_entries()
+        if entries:
+            box.append(Gtk.Separator())
+            for entry in entries:
+                path = entry["path"]
+                row = Gtk.Box(spacing=6)
+                go = Gtk.Button(hexpand=True)
+                name = entry["name"] or self.backend.basename(path) or path
+                name_label = Gtk.Label(label=name, xalign=0, hexpand=True)
+                name_label.set_ellipsize(Pango.EllipsizeMode.END)
+                go.set_child(name_label)
+                go.add_css_class("flat")
+                go.set_tooltip_text(path)
+                go.connect("clicked", lambda *_c, _path=path: (
+                    popover.popdown(), self.navigate(_path)))
+                rename = Gtk.Button(icon_name="document-edit-symbolic")
+                rename.add_css_class("flat")
+                rename.set_valign(Gtk.Align.CENTER)
+                rename.set_tooltip_text("重命名收藏")
+                rename.connect("clicked", lambda *_c, _entry=entry: (
+                    popover.popdown(), self._prompt_rename_bookmark(_entry)))
+                remove = Gtk.Button(icon_name="user-trash-symbolic")
+                remove.add_css_class("flat")
+                remove.set_valign(Gtk.Align.CENTER)
+                remove.set_tooltip_text("删除收藏")
+                remove.connect("clicked", lambda *_c, _path=path: (
+                    self._remove_bookmark(_path),
+                    self._rebuild_bookmark_popover()))
+                row.append(go)
+                row.append(rename)
+                row.append(remove)
+                box.append(row)
+        else:
+            empty = Gtk.Label(label="还没有收藏路径", xalign=0)
+            empty.add_css_class("dim-label")
+            empty.set_margin_top(4)
+            box.append(empty)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_max_content_height(420)
+        scrolled.set_child(box)
+        popover.set_child(scrolled)
 
     # ---- 连接弹出菜单 ----
     def _rebuild_connect_popover(self, *args):
@@ -758,7 +920,7 @@ class FilePane(Gtk.Box):
     def _menu_entries(self):
         """右键菜单条目: (标签, 动作名后缀, 快捷键文本) 或 "sep" (分隔线)."""
         has_sel = bool(self._selected_items())
-        entries = []
+        entries = [("刷新", "refresh", None)]
         if has_sel:
             entries += [("传输到对侧", "transfer", None),
                         ("复制", "copy", "Ctrl+C"),
@@ -769,10 +931,8 @@ class FilePane(Gtk.Box):
         entries.append("sep")
         entries.append(("新建文件夹", "mkdir", None))
         if has_sel:
-            entries.append(("重命名", "rename", "F2"))
-        if has_sel:
-            entries.append(("复制完整路径", "copy-path", None))
-        entries.append(("刷新", "refresh", None))
+            entries += [("重命名", "rename", "F2"),
+                        ("复制完整路径", "copy-path", None)]
         return entries
 
     def _popup_menu_at(self, x, y):

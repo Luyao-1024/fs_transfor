@@ -19,6 +19,7 @@ DEFAULT_SETTINGS = {
     "show_hidden": False,
     "tabs": [],          # [{"left": {...}, "right": {...}}, ...]
     "active_tab": 0,
+    "bookmarks": {},     # {"local" | "ssh:[...]": [{"path": ..., "name": ...}]}
 }
 
 # 服务器配置字段(密码/口令永不落盘)
@@ -108,6 +109,90 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict):
     _save_json(SETTINGS_FILE, settings)
+
+
+def bookmark_scope_key(server_cfg: dict | None) -> str:
+    """返回收藏分组键；本地独立，远程按主机、端口和用户名隔离。"""
+    if not server_cfg:
+        return "local"
+    host = str(server_cfg.get("host") or "").strip().casefold()
+    try:
+        port = int(server_cfg.get("port") or 22)
+    except (TypeError, ValueError):
+        port = 22
+    username = str(server_cfg.get("username") or "")
+    identity = json.dumps([host, port, username], ensure_ascii=False,
+                          separators=(",", ":"))
+    return f"ssh:{identity}"
+
+
+def bookmark_entries(settings: dict, server_cfg: dict | None) -> list[dict]:
+    """取得收藏条目，并把旧版纯路径列表迁移为带名称的结构。"""
+    groups = settings.get("bookmarks")
+    if not isinstance(groups, dict):
+        groups = {}
+        settings["bookmarks"] = groups
+    key = bookmark_scope_key(server_cfg)
+    raw = groups.get(key, [])
+    entries = []
+    seen = set()
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            path, name = item, ""
+        elif isinstance(item, dict):
+            path = item.get("path")
+            name = item.get("name")
+        else:
+            continue
+        if not isinstance(path, str) or not path or path in seen:
+            continue
+        seen.add(path)
+        entries.append({"path": path,
+                        "name": name.strip() if isinstance(name, str) else ""})
+    if entries != raw:
+        groups[key] = entries
+    return entries
+
+
+def bookmark_paths(settings: dict, server_cfg: dict | None) -> list[str]:
+    """兼容调用方：返回当前分组中的路径列表。"""
+    return [entry["path"] for entry in bookmark_entries(settings, server_cfg)]
+
+
+def set_bookmark_entries(settings: dict, server_cfg: dict | None,
+                         entries: list[dict]):
+    """写入带显示名称的收藏条目。"""
+    groups = settings.setdefault("bookmarks", {})
+    if not isinstance(groups, dict):
+        groups = {}
+        settings["bookmarks"] = groups
+    clean = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        name = entry.get("name")
+        if not isinstance(path, str) or not path or path in seen:
+            continue
+        seen.add(path)
+        clean.append({"path": path,
+                      "name": name.strip() if isinstance(name, str) else ""})
+    key = bookmark_scope_key(server_cfg)
+    if clean:
+        groups[key] = clean
+    else:
+        groups.pop(key, None)
+
+
+def set_bookmark_paths(settings: dict, server_cfg: dict | None,
+                       paths: list[str]):
+    """按路径写入分组，同时保留仍存在路径的已有名称。"""
+    names = {entry["path"]: entry["name"]
+             for entry in bookmark_entries(settings, server_cfg)}
+    set_bookmark_entries(settings, server_cfg,
+                         [{"path": path, "name": names.get(path, "")}
+                          for path in paths])
 
 
 def load_ssh_config_hosts() -> list[dict]:
