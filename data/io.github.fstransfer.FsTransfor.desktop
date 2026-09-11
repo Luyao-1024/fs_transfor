@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FsTransfor
+GenericName=文件传输器
+Comment=GTK4 双面板 SSH/SFTP 文件传输器
+Exec=fstransfor
+Icon=io.github.fstransfer.FsTransfor
+Terminal=false
+Categories=Network;FileTransfer;FileManager;
+Keywords=ssh;sftp;transfer;scp;文件;传输;
+StartupNotify=true

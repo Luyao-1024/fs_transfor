@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3f8ef0"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+    <linearGradient id="pane" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d8e6f8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板 -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#bg)"/>
+
+  <!-- 左右双面板 -->
+  <rect x="16" y="30" width="32" height="56" rx="7" fill="url(#pane)"/>
+  <rect x="80" y="30" width="32" height="56" rx="7" fill="url(#pane)"/>
+
+  <!-- 面板标题条 -->
+  <rect x="16" y="30" width="32" height="14" rx="7" fill="#99c1f1"/>
+  <rect x="16" y="37" width="32" height="7" fill="#99c1f1"/>
+  <rect x="80" y="30" width="32" height="14" rx="7" fill="#99c1f1"/>
+  <rect x="80" y="37" width="32" height="7" fill="#99c1f1"/>
+
+  <!-- 文件行 -->
+  <rect x="22" y="52" width="20" height="4" rx="2" fill="#a9c8ef"/>
+  <rect x="22" y="61" width="20" height="4" rx="2" fill="#a9c8ef"/>
+  <rect x="22" y="70" width="14" height="4" rx="2" fill="#a9c8ef"/>
+  <rect x="86" y="52" width="20" height="4" rx="2" fill="#a9c8ef"/>
+  <rect x="86" y="61" width="20" height="4" rx="2" fill="#a9c8ef"/>
+  <rect x="86" y="70" width="14" height="4" rx="2" fill="#a9c8ef"/>
+
+  <!-- 中央传输箭头: 上行/下行 -->
+  <g stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M58 84 V40"/>
+    <path d="M49.5 48.5 L58 40 L66.5 48.5"/>
+    <path d="M70 44 V88"/>
+    <path d="M61.5 79.5 L70 88 L78.5 79.5"/>
+  </g>
+</svg>
