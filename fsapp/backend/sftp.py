@@ -142,6 +142,7 @@ class SftpBackend(BaseBackend):
             transport.set_keepalive(30)
         try:
             self.sftp = client.open_sftp()
+            self.sftp.get_channel().settimeout(15)
         except paramiko.SSHException as e:
             client.close()
             raise BackendError(f"打开 SFTP 会话失败: {e}") from None

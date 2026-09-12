@@ -12,7 +12,7 @@ import threading
 from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango
 
 from . import config
-from .backend.base import BackendError
+from .backend.base import BackendError, CancelledError
 from .backend.local import LocalBackend
 from .connect_dialog import (ConnectDialog, TextPromptDialog, ask_delete,
                              ask_delete_local, ask_permanent_delete)
@@ -40,7 +40,12 @@ class FilePane(Gtk.Box):
         self.backend = LocalBackend()
         self.server_cfg: dict | None = None
         self.cwd = self.backend.home()
+        self._history = [self.cwd]
+        self._history_index = 0
+        self._recent_paths = [self.cwd]
+        self._filter_text = ""
         self._token = 0
+        self._scan_cancel = threading.Event()
         self.suspended = False  # 连接暂停/断开: 文件界面保留并显示背景提示
         self._cell_items = {}  # 单元格内容部件 → FileItem (bind 时记录)
         self._interactive_rows = set()  # 已安装右键/拖动控制器的完整高亮行
@@ -93,6 +98,23 @@ class FilePane(Gtk.Box):
         self.path_entry.connect("icon-press", self._on_entry_icon_press)
         bar.append(self.path_entry)
 
+        self.back_btn = Gtk.Button(icon_name="go-previous-symbolic")
+        self.back_btn.set_tooltip_text("后退 (Alt+Left)")
+        self.back_btn.connect("clicked", lambda *_: self.go_back())
+        bar.insert_child_after(self.back_btn, self.spinner)
+
+        self.forward_btn = Gtk.Button(icon_name="go-next-symbolic")
+        self.forward_btn.set_tooltip_text("前进 (Alt+Right)")
+        self.forward_btn.connect("clicked", lambda *_: self.go_forward())
+        bar.insert_child_after(self.forward_btn, self.back_btn)
+
+        self.recent_btn = Gtk.MenuButton(icon_name="document-open-recent-symbolic")
+        self.recent_btn.set_tooltip_text("最近路径")
+        recent_popover = Gtk.Popover()
+        recent_popover.connect("show", self._rebuild_recent_popover)
+        self.recent_btn.set_popover(recent_popover)
+        bar.insert_child_after(self.recent_btn, self.forward_btn)
+
         self.bookmark_btn = Gtk.MenuButton(icon_name="non-starred-symbolic")
         self.bookmark_btn.set_tooltip_text("路径收藏")
         bookmark_popover = Gtk.Popover()
@@ -100,19 +122,37 @@ class FilePane(Gtk.Box):
         self.bookmark_btn.set_popover(bookmark_popover)
         bar.append(self.bookmark_btn)
 
-        up = Gtk.Button(icon_name="go-previous-symbolic")
+        up = Gtk.Button(icon_name="go-up-symbolic")
         up.set_tooltip_text("上一级目录")
-        up.connect("clicked", lambda *_: self.navigate(self.backend.parent(self.cwd)))
+        up.connect("clicked", lambda *_: self.go_parent())
         bar.append(up)
         self.up_btn = up
 
         home = Gtk.Button(icon_name="user-home-symbolic")
         home.set_tooltip_text("主目录")
-        home.connect("clicked", lambda *_: self.navigate(self.backend.home()))
+        home.connect("clicked", lambda *_: self.go_home())
         bar.append(home)
         self.home_btn = home
 
+        self.filter_btn = Gtk.ToggleButton(icon_name="edit-find-symbolic")
+        self.filter_btn.set_tooltip_text("筛选当前目录 (Ctrl+F)")
+        self.filter_btn.connect("toggled", self._on_filter_toggled)
+        bar.append(self.filter_btn)
+
         self.append(bar)
+
+        self.filter_revealer = Gtk.Revealer()
+        self.filter_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        filter_box = Gtk.Box(spacing=6, margin_start=6, margin_end=6,
+                             margin_bottom=6)
+        self.filter_entry = Gtk.SearchEntry(hexpand=True,
+                                            placeholder_text="筛选当前目录中的名称")
+        self.filter_entry.set_tooltip_text("只筛选当前列表，不改变所在目录")
+        self.filter_entry.connect("search-changed", self._on_filter_changed)
+        self.filter_entry.connect("stop-search", lambda *_: self.hide_filter())
+        filter_box.append(self.filter_entry)
+        self.filter_revealer.set_child(filter_box)
+        self.append(self.filter_revealer)
 
     def _build_stack(self):
         self.stack = Gtk.Stack()
@@ -158,7 +198,10 @@ class FilePane(Gtk.Box):
     # ------------------------------------------------------------------
     def _build_view(self):
         self.store = Gio.ListStore.new(FileItem)
-        self.sort_model = Gtk.SortListModel(model=self.store)
+        self.name_filter = Gtk.CustomFilter.new(self._filter_item)
+        self.filter_model = Gtk.FilterListModel(model=self.store,
+                                                filter=self.name_filter)
+        self.sort_model = Gtk.SortListModel(model=self.filter_model)
         self.selection = Gtk.MultiSelection(model=self.sort_model)
         self.selection.connect("selection-changed", self._on_selection_changed)
         self.view = Gtk.ColumnView(model=self.selection)
@@ -181,9 +224,9 @@ class FilePane(Gtk.Box):
         self.empty_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
         self.empty_revealer.set_can_target(False)
         empty_box = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
-        empty_lbl = Gtk.Label(label="此目录为空")
-        empty_lbl.add_css_class("dim-label")
-        empty_box.append(empty_lbl)
+        self.empty_label = Gtk.Label(label="此目录为空")
+        self.empty_label.add_css_class("dim-label")
+        empty_box.append(self.empty_label)
         self.empty_revealer.set_child(empty_box)
 
         # 连接暂停/断开的背景提示: 文件列表保留(清空条目), 覆盖提示词
@@ -342,29 +385,157 @@ class FilePane(Gtk.Box):
     # ==================================================================
     # 列表加载
     # ==================================================================
-    def navigate(self, path: str):
+    def navigate(self, path: str, record_history: bool = True):
+        path = self.backend.normpath(path)
         if path == self.cwd:
             self.refresh()
             return
-        path = self.backend.normpath(path)
+        self._clear_filter()
         self.cwd = path
+        if record_history:
+            self._record_navigation(path)
+        else:
+            self._remember_recent(path)
+        self._sync_navigation_buttons()
         self.refresh()
+
+    def _reset_navigation(self, path: str):
+        """切换后端时建立独立历史，避免跨服务器复用无效路径。"""
+        path = self.backend.normpath(path)
+        self._clear_filter()
+        self.cwd = path
+        self._history = [path]
+        self._history_index = 0
+        self._recent_paths = [path]
+        self._sync_navigation_buttons()
+        self.refresh()
+
+    def _record_navigation(self, path: str):
+        if self._history_index < len(self._history) - 1:
+            self._history = self._history[:self._history_index + 1]
+        if not self._history or self._history[-1] != path:
+            self._history.append(path)
+            if len(self._history) > 50:
+                self._history.pop(0)
+        self._history_index = len(self._history) - 1
+        self._remember_recent(path)
+
+    def _remember_recent(self, path: str):
+        self._recent_paths = [p for p in self._recent_paths if p != path]
+        self._recent_paths.insert(0, path)
+        del self._recent_paths[20:]
+
+    def go_back(self):
+        if self.suspended or self._history_index <= 0:
+            return
+        self._history_index -= 1
+        self.navigate(self._history[self._history_index], record_history=False)
+
+    def go_forward(self):
+        if self.suspended or self._history_index >= len(self._history) - 1:
+            return
+        self._history_index += 1
+        self.navigate(self._history[self._history_index], record_history=False)
+
+    def go_parent(self):
+        if not self.suspended:
+            self.navigate(self.backend.parent(self.cwd))
+
+    def go_home(self):
+        if not self.suspended:
+            self.navigate(self.backend.home())
+
+    def focus_path(self):
+        if self.path_entry.get_sensitive():
+            self.workspace.activate_pane(self)
+            self.path_entry.grab_focus()
+            self.path_entry.select_region(0, -1)
+
+    def show_filter(self):
+        if not self.filter_btn.get_sensitive():
+            return
+        self.workspace.activate_pane(self)
+        self.filter_btn.set_active(True)
+        self.filter_entry.grab_focus()
+
+    def hide_filter(self):
+        self._clear_filter()
+        self.filter_btn.set_active(False)
+        self.view.grab_focus()
+
+    def _on_filter_toggled(self, button):
+        visible = button.get_active()
+        self.filter_revealer.set_reveal_child(visible)
+        if visible:
+            self.filter_entry.grab_focus()
+        else:
+            self._clear_filter()
+
+    def _on_filter_changed(self, entry):
+        text = entry.get_text().strip().casefold()
+        if text == self._filter_text:
+            return
+        # 位置会因过滤而重排；先清空可确保隐藏条目不参与后续操作。
+        self.selection.unselect_all()
+        self._filter_text = text
+        self.name_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self._sync_empty_state()
+
+    def _clear_filter(self):
+        if not hasattr(self, "filter_entry"):
+            return
+        if self.filter_entry.get_text():
+            self.filter_entry.set_text("")
+        if self._filter_text:
+            self.selection.unselect_all()
+            self._filter_text = ""
+            self.name_filter.changed(Gtk.FilterChange.DIFFERENT)
+            self._sync_empty_state()
+
+    def _filter_item(self, item):
+        return not self._filter_text or self._filter_text in item.entry.name.casefold()
+
+    def _sync_empty_state(self):
+        filtered_empty = self.sort_model.get_n_items() == 0
+        has_unfiltered = self.store.get_n_items() > 0
+        self.empty_label.set_text(
+            "没有匹配的项目" if self._filter_text and has_unfiltered else "此目录为空")
+        self.empty_revealer.set_reveal_child(filtered_empty)
+
+    def _sync_navigation_buttons(self):
+        if not hasattr(self, "back_btn"):
+            return
+        usable = (self.stack.get_visible_child_name() == "files"
+                  and not self.suspended)
+        self.back_btn.set_sensitive(usable and self._history_index > 0)
+        self.forward_btn.set_sensitive(
+            usable and self._history_index < len(self._history) - 1)
+        self.recent_btn.set_sensitive(usable and len(self._recent_paths) > 1)
 
     def refresh(self):
         if self.stack.get_visible_child_name() != "files" or self.suspended:
             return
-        self._token += 1
+        self._cancel_browse()
         token = self._token
         path = self.cwd
         self.spinner.set_visible(True)
         self.spinner.start()
         backend = self.backend
-        threading.Thread(target=self._load, args=(backend, token, path),
+        threading.Thread(target=self._load, args=(backend, token, path, self._scan_cancel),
                          daemon=True).start()
 
-    def _load(self, backend, token, path):
+    def _cancel_browse(self):
+        self._scan_cancel.set()
+        self._scan_cancel = threading.Event()
+        self._token += 1
+        self.spinner.stop()
+        self.spinner.set_visible(False)
+
+    def _load(self, backend, token, path, cancel_event):
         try:
-            entries = backend.list_dir(path)
+            entries = list(backend.iter_dir(path, cancel_event))
+        except CancelledError:
+            return
         except BackendError as e:
             dead = (not backend.is_local) and backend.dead
             GLib.idle_add(self._load_failed, token, path, str(e),
@@ -382,7 +553,8 @@ class FilePane(Gtk.Box):
         self.store.splice(0, self.store.get_n_items(), items)
         self.path_entry.set_text(path)
         self.cwd = path
-        self.empty_revealer.set_reveal_child(not items)
+        self._sync_empty_state()
+        self._sync_navigation_buttons()
         self._sync_bookmark_button()
         self.window.on_pane_path_changed(self)
         return False
@@ -405,6 +577,8 @@ class FilePane(Gtk.Box):
     # 连接管理(经由 window.hub 连接池)
     # ==================================================================
     def connect_local(self, path: str | None = None):
+        self.window.hub.cancel_pending(self)
+        self._cancel_browse()
         self.suspended = False
         self._hide_suspend_hint()
         if self.server_cfg is not None and not self.backend.is_local:
@@ -412,10 +586,11 @@ class FilePane(Gtk.Box):
         self.backend = self.window.local_backend
         self.server_cfg = None
         self._set_state("files")
-        self.navigate(path or self.backend.home())
+        self._reset_navigation(path or self.backend.home())
 
     def connect_server_async(self, cfg: dict, creds: dict | None = None, path: str | None = None):
         """连接服务器(同服务器已在别处连接时立即复用). creds 为会话级凭据."""
+        self._cancel_browse()
         self.suspended = False
         self._hide_suspend_hint()
         if self.server_cfg is not None and not self.backend.is_local:
@@ -438,7 +613,7 @@ class FilePane(Gtk.Box):
         self.server_cfg = cfg
         self._set_state("files")
         self._sync_toolbar()
-        self.navigate(path or backend.home())
+        self._reset_navigation(path or backend.home())
         self.window.on_pane_connected(self)
         self.window.toast(f"已连接 {backend.label}")
         return False
@@ -454,6 +629,7 @@ class FilePane(Gtk.Box):
 
         不退出文件界面: 清空列表并显示背景提示, 工具栏按钮切换为"恢复".
         """
+        self._cancel_browse()
         self.suspended = True
         self._show_suspend_hint("连接已断开", msg or "点击工具栏播放图标恢复连接")
         self._sync_toolbar()
@@ -470,6 +646,7 @@ class FilePane(Gtk.Box):
         暂停期间仍接收断线通知, 提示词会更新为"连接已断开"."""
         if self.server_cfg is None or self.suspended:
             return
+        self._cancel_browse()
         self.suspended = True
         self._show_suspend_hint("连接已暂停", "点击工具栏播放图标恢复连接")
         self._sync_toolbar()
@@ -543,7 +720,42 @@ class FilePane(Gtk.Box):
         self.bookmark_btn.set_sensitive(sensitive)
         self.up_btn.set_sensitive(sensitive)
         self.home_btn.set_sensitive(sensitive)
+        self.filter_btn.set_sensitive(sensitive)
+        self.filter_entry.set_sensitive(sensitive)
+        self._sync_navigation_buttons()
         self._sync_bookmark_button()
+
+    def _rebuild_recent_popover(self, *args):
+        popover = self.recent_btn.get_popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for margin in ("start", "end", "top", "bottom"):
+            getattr(box, f"set_margin_{margin}")(8)
+        title = Gtk.Label(label="最近路径", xalign=0)
+        title.add_css_class("heading")
+        box.append(title)
+        paths = [path for path in self._recent_paths if path != self.cwd]
+        if paths:
+            box.append(Gtk.Separator())
+            for path in paths:
+                button = Gtk.Button(hexpand=True)
+                label = Gtk.Label(label=path, xalign=0, hexpand=True)
+                label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                button.set_child(label)
+                button.add_css_class("flat")
+                button.set_tooltip_text(path)
+                button.connect("clicked", lambda *_c, _path=path: (
+                    popover.popdown(), self.navigate(_path)))
+                box.append(button)
+        else:
+            empty = Gtk.Label(label="还没有其他访问记录", xalign=0)
+            empty.add_css_class("dim-label")
+            box.append(empty)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_max_content_height(360)
+        scrolled.set_child(box)
+        popover.set_child(scrolled)
 
     # ---- 路径收藏 ----
     def _bookmark_entries(self):
@@ -714,9 +926,14 @@ class FilePane(Gtk.Box):
             box.append(lbl)
 
         if self.server_cfg is not None:
-            b = Gtk.Button(label=f"断开 {self.backend.label}，回到本地")
+            b = Gtk.Button(label="此面板回到本地（传输继续）")
             b.connect("clicked", lambda *_: (popover.popdown(), self.disconnect_remote()))
             box.append(b)
+            disconnect = Gtk.Button(label=f"断开 {self.backend.label} 的所有面板连接…")
+            backend = self.backend
+            disconnect.connect("clicked", lambda *_: (
+                popover.popdown(), self.window.disconnect_connection(backend)))
+            box.append(disconnect)
             box.append(Gtk.Separator())
 
         servers = config.load_servers()
@@ -1055,7 +1272,7 @@ class FilePane(Gtk.Box):
         # 移动语义在核心层: 只有成功提交的项目才删源, 跳过/失败保留源
         t = self.window.manager.enqueue(src_backend, paths, self.backend, self.cwd,
                                         move=(mode == "cut"))
-        if t is not None and mode == "cut":
+        if t is not None and t.status != "error" and mode == "cut":
             self.window.clear_clipboard()
 
     # ---- 其他操作 ----
@@ -1071,14 +1288,18 @@ class FilePane(Gtk.Box):
         clipboard.set(v)
 
     def _action_mkdir(self):
-        TextPromptDialog(self.window, self._do_mkdir, "新建文件夹", ok_label="创建")
+        backend, path = self.backend, self.cwd
+        TextPromptDialog(self.window, lambda name: self._do_mkdir(name, backend, path),
+                         "新建文件夹", ok_label="创建")
 
-    def _do_mkdir(self, name):
+    def _do_mkdir(self, name, backend=None, path=None):
         if not name:
             return
+        backend = self.backend if backend is None else backend
+        path = self.cwd if path is None else path
 
         def op():
-            self.backend.mkdir(self.backend.join(self.cwd, name))
+            backend.mkdir(backend.join(path, name))
         self._run_op(op)
 
     def _action_rename(self):
@@ -1087,15 +1308,18 @@ class FilePane(Gtk.Box):
             self.window.toast("请选择单个项目重命名")
             return
         entry = items[0].entry
-        TextPromptDialog(self.window, lambda n: self._do_rename(entry, n),
+        backend, path = self.backend, self.cwd
+        TextPromptDialog(self.window, lambda n: self._do_rename(entry, n, backend, path),
                          "重命名", initial=entry.name, ok_label="重命名")
 
-    def _do_rename(self, entry, new_name):
+    def _do_rename(self, entry, new_name, backend=None, path=None):
         if not new_name or new_name == entry.name:
             return
+        backend = self.backend if backend is None else backend
+        path = self.cwd if path is None else path
 
         def op():
-            self.backend.rename(entry.path, self.backend.join(self.cwd, new_name))
+            backend.rename(entry.path, backend.join(path, new_name))
         self._run_op(op)
 
     def _action_delete(self):
@@ -1103,19 +1327,20 @@ class FilePane(Gtk.Box):
         if not items:
             return
         names = [it.entry.name for it in items]
-        if self.backend.is_local:
+        backend = self.backend
+        if backend.is_local:
             # 本地: 对话框中选择 移入回收站(可找回) 或 直接删除
             ask_delete_local(self.window, names,
                              lambda mode: mode and self._do_delete(
-                                 items, mode == "trash"))
+                                 items, mode == "trash", backend))
         else:
             # 远程: 永久删除, 必须确认
             ask_delete(self.window, names,
-                       lambda ok: ok and self._do_delete(items, False))
+                       lambda ok: ok and self._do_delete(items, False, backend))
 
-    def _do_delete(self, items, to_trash):
+    def _do_delete(self, items, to_trash, backend=None):
         paths = [it.entry.path for it in items]
-        backend = self.backend
+        backend = self.backend if backend is None else backend
 
         def op():
             permanent = not to_trash
@@ -1139,18 +1364,29 @@ class FilePane(Gtk.Box):
         self._run_op(op)
 
     def _run_op(self, op):
+        if self.window._exit_mode or self.window._closed:
+            self.window.toast("正在退出，无法执行新操作", True)
+            return
         if self.suspended:
             self.window.toast("连接已暂停，无法执行该操作", True)
             return
-        backend = self.backend
+        token = object()
+        self.window._operations.add(token)
+
+        def finished():
+            self.window._operations.discard(token)
+            if not self.workspace.closed:
+                self.refresh()
 
         def work():
             try:
+                if self.window._cancel_dialogs.is_set():
+                    return
                 op()
             except BackendError as e:
                 GLib.idle_add(self.window.toast, str(e), True)
-            else:
-                GLib.idle_add(self.refresh)
+            finally:
+                GLib.idle_add(finished)
         threading.Thread(target=work, daemon=True).start()
 
     # ==================================================================

@@ -52,6 +52,13 @@ class Workspace(Gtk.Box):
             "paste": "_action_paste",
             "delete": "_action_delete",
             "rename": "_action_rename",
+            "back": "go_back",
+            "forward": "go_forward",
+            "parent": "go_parent",
+            "home": "go_home",
+            "location": "focus_path",
+            "filter": "show_filter",
+            "refresh": "refresh",
         }
         for name, method in actions.items():
             action = f"{self.wid}.{name}"
@@ -67,6 +74,13 @@ class Workspace(Gtk.Box):
             ("<Primary>v", "paste"),
             ("Delete", "delete"),
             ("F2", "rename"),
+            ("<Alt>Left", "back"),
+            ("<Alt>Right", "forward"),
+            ("<Alt>Up", "parent"),
+            ("<Alt>Home", "home"),
+            ("<Primary>l", "location"),
+            ("<Primary>f", "filter"),
+            ("F5", "refresh"),
         ):
             shortcuts.add_shortcut(Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string(accel),
@@ -93,6 +107,7 @@ class Workspace(Gtk.Box):
         """标签页关闭: 释放连接引用与挂起的连接请求."""
         self.closed = True
         for pane in (self.left, self.right):
+            pane._cancel_browse()
             if pane.server_cfg is not None and not pane.backend.is_local:
                 try:
                     self.window.hub.release(pane, pane.backend)

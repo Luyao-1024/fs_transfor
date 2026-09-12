@@ -7,7 +7,7 @@ import stat as stat_mod
 
 from gi.repository import Gio, GLib
 
-from .base import BaseBackend, BackendError, FileEntry, perms_str
+from .base import BaseBackend, BackendError, CancelledError, FileEntry, perms_str
 
 
 def _wrap(fn, *args, **kwargs):
@@ -27,11 +27,13 @@ class LocalBackend(BaseBackend):
     def label(self):
         return "本地"
 
-    def list_dir(self, path):
+    def list_dir(self, path, cancel_event=None):
         def go():
             out = []
             with os.scandir(path) as it:
                 for d in it:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError("已取消")
                     try:
                         st = d.stat(follow_symlinks=False)
                     except OSError:
@@ -47,6 +49,9 @@ class LocalBackend(BaseBackend):
                     ))
             return out
         return _wrap(go)
+
+    def iter_dir(self, path, cancel_event=None):
+        return iter(self.list_dir(path, cancel_event))
 
     def stat(self, path):
         try:

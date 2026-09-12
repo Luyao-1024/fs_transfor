@@ -13,8 +13,15 @@ class Application(Adw.Application):
         Adw.Application.do_startup(self)
         if self.lookup_action("quit") is None:
             action = Gio.SimpleAction.new("quit", None)
-            action.connect("activate", lambda *a: self.quit())
+            action.connect("activate", self._request_quit)
             self.add_action(action)
+
+    def _request_quit(self, *args):
+        win = self.props.active_window
+        if win is not None:
+            win.request_exit()
+        else:
+            self.quit()
 
     def do_activate(self):
         win = self.props.active_window
