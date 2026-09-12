@@ -136,7 +136,7 @@ class BaseBackend(ABC):
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("已取消")
             cur, rel = stack.pop()
-            for e in self.list_dir(cur):
+            for e in self.iter_dir(cur, cancel_event):
                 r = f"{rel}/{e.name}" if rel else e.name
                 if e.is_dir:
                     dirs.append(r)
@@ -145,3 +145,11 @@ class BaseBackend(ABC):
                     files.append((e.path, r, e.size))
                     total += e.size
         return dirs, files, total
+
+    def iter_dir(self, path, cancel_event=None):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("已取消")
+        for entry in self.list_dir(path):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("已取消")
+            yield entry

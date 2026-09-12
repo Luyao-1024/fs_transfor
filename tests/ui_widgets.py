@@ -188,10 +188,10 @@ def main():
     def step_wait_autohide(tmpdir):
         win = state["win"]
         elapsed = (GLib.get_monotonic_time() - state["done_seen_at"]) / 1_000_000
-        if win.manager.transfers and elapsed < 4.0:
+        if win.transfer_panel._rows and elapsed < 4.0:
             return GLib.SOURCE_CONTINUE
-        check(not win.manager.transfers,
-              f"成功任务约 3 秒后自动移除({elapsed:.1f}s)")
+        check(win.manager.transfers and all(t.status == "done" for t in win.manager.transfers),
+              f"成功通知约 3 秒后隐藏，任务记录仍可查询({elapsed:.1f}s)")
         check(not win.transfer_panel._rows,
               "完成任务移除后不残留传输行")
         check(not win.transfer_panel.get_reveal_child(),

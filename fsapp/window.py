@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
@@ -11,6 +12,8 @@ from .connect_dialog import ask_overwrite
 from .connections import ConnectionHub
 from .transfer import TransferManager
 from .transfer_row import TransferPanel
+from .task_history import TaskHistory
+from .task_center import TaskCenter
 from .util import fmt_speed
 from .workspace import Workspace
 
@@ -62,13 +65,22 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings = config.load_settings()
         self.show_hidden = self.settings.get("show_hidden", False)
         self.local_backend = LocalBackend()
-        self.manager = TransferManager()
-        self.manager.ask_overwrite = self._ask_overwrite
-        self.manager.add_listener(self._on_manager_changed)
         self.hub = ConnectionHub(self)
+        self.manager = TransferManager(self.hub)
+        self.manager.ask_overwrite = self._ask_overwrite
+        self.manager.ask_conflict = self._ask_task_overwrite
+        self.manager.add_listener(self._on_manager_changed)
         self._drag_payloads: dict = {}
         self._clip: tuple | None = None  # (backend, src_dir, paths, 'copy'|'cut')
         self._restored = False
+        self._exit_mode = None
+        self._exit_dialog = None
+        self._closed = False
+        self._cancel_dialogs = threading.Event()
+        self._dialog_waiters = {}
+        self._operations = set()
+        self._task_center = None
+        self._disconnecting = set()
 
         self.workspaces: list[Workspace] = []
         self._ws_counter = 0
@@ -90,6 +102,9 @@ class MainWindow(Adw.ApplicationWindow):
         new_tab_btn.set_tooltip_text("新标签页 (Ctrl+T)")
         new_tab_btn.set_action_name("win.new-tab")
         header.pack_start(new_tab_btn)
+        task_button = Gtk.Button(icon_name="view-list-symbolic", tooltip_text="任务中心")
+        task_button.set_action_name("win.tasks")
+        header.pack_end(task_button)
 
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_btn.set_menu_model(self._build_menu())
@@ -128,7 +143,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._install_actions()
         self._install_shortcuts()
 
-        GLib.timeout_add(300, self._on_tick)
+        self.manager.history = TaskHistory(config.CONFIG_DIR / "tasks.json",
+                                           lambda msg: GLib.idle_add(self.toast, msg, True))
+        self._tick_id = GLib.timeout_add(300, self._on_tick)
         self.connect("close-request", self._on_close)
 
     # ------------------------------------------------------------------
@@ -210,6 +227,7 @@ class MainWindow(Adw.ApplicationWindow):
         s2 = Gio.Menu.new()
         s2.append("新建标签页", "win.new-tab")
         s2.append("关闭当前标签页", "win.close-tab")
+        s2.append("任务中心", "win.tasks")
         menu.append_section(None, s2)
         s3 = Gio.Menu.new()
         s3.append("关于", "win.about")
@@ -229,7 +247,8 @@ class MainWindow(Adw.ApplicationWindow):
         b.connect("change-state", self._on_toggle_autoconnect)
         self.add_action(b)
 
-        for name, cb in (("new-tab", self._on_new_tab), ("close-tab", self._on_close_tab)):
+        for name, cb in (("new-tab", self._on_new_tab), ("close-tab", self._on_close_tab),
+                         ("tasks", self._show_tasks)):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", cb)
             self.add_action(act)
@@ -260,6 +279,47 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_new_tab(self, *args):
         self.new_workspace()
 
+    def _show_tasks(self, *args):
+        if self._task_center is None:
+            self._task_center = TaskCenter(self)
+            self._task_center.connect("closed", lambda *_: setattr(self, "_task_center", None))
+        self._task_center.present(self)
+
+    def disconnect_connection(self, backend):
+        if backend.is_local or backend in self._disconnecting:
+            return
+        tasks = [t for t in self.manager.transfers if t.running
+                 and (t.src is backend or t.dst is backend)]
+        dlg = Adw.AlertDialog.new("断开此服务器？",
+                                  f"将影响所有使用此服务器的面板，并取消 {len(tasks)} 个传输任务。"
+                                  "等待任务清理临时文件后断开。")
+        dlg.add_response("return", "保留连接")
+        dlg.add_response("disconnect", "取消相关任务并断开")
+        dlg.set_close_response("return")
+        dlg.set_response_appearance("disconnect", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def chosen(dialog, result):
+            if dialog.choose_finish(result) != "disconnect":
+                return
+            self._disconnecting.add(backend)
+            for entry in self.hub._live.values():
+                if entry.backend is backend:
+                    entry.disconnecting = True
+            for task in list(self.manager.transfers):
+                if task.src is backend or task.dst is backend:
+                    self.manager.cancel(task.id)
+            self._check_disconnects()
+        dlg.choose(self, None, chosen)
+
+    def _check_disconnects(self):
+        for backend in list(self._disconnecting):
+            busy = any((t.src is backend or t.dst is backend)
+                       and (t.running or (t.future is not None and not t.future.done()))
+                       for t in self.manager.transfers)
+            if not busy:
+                self.hub.mark_dead(backend, "用户已断开连接，可重新连接")
+                self._disconnecting.discard(backend)
+
     def _on_close_tab(self, *args):
         page = self.tab_view.get_selected_page()
         if page is not None:
@@ -273,9 +333,76 @@ class MainWindow(Adw.ApplicationWindow):
         dlg.present(self)
 
     def _on_close(self, *args):
+        if self._closed:
+            return False
+        if self._exit_mode is not None:
+            self._show_exit_dialog()
+            return True
+        if self.manager.busy or self._operations:
+            self._show_exit_dialog()
+            return True
+        self._finish_close()
+        return True
+
+    def request_exit(self):
+        """菜单退出即使有模态确认框，也进入窗口的退出协调器。"""
+        self._on_close()
+
+    def _show_exit_dialog(self):
+        if self._exit_dialog is not None:
+            return
+        dlg = Adw.AlertDialog.new("退出前处理正在执行的任务", "等待任务完成，或取消任务并在清理临时文件后退出。")
+        dlg.add_response("return", "返回应用")
+        dlg.add_response("wait", "等待完成后退出")
+        dlg.add_response("cancel", "取消任务并退出")
+        dlg.set_close_response("return")
+        dlg.set_default_response("return")
+        dlg.set_response_appearance("cancel", Adw.ResponseAppearance.DESTRUCTIVE)
+        self._exit_dialog = dlg
+
+        def chosen(dialog, result):
+            self._exit_dialog = None
+            self._choose_exit(dialog.choose_finish(result))
+        dlg.choose(self, None, chosen)
+
+    def _choose_exit(self, response):
+        if self._closed:
+            return
+        if response not in ("wait", "cancel"):
+            if self._exit_mode != "cancel":
+                self._exit_mode = None
+                self.manager.accepting = True
+                self.hub.closing = False
+            return
+        self._exit_mode = response
+        self.manager.stop_accepting(cancel=response == "cancel")
+        self.hub.stop_connecting()
+        if response == "cancel":
+            self._cancel_dialogs.set()
+            self._dismiss_dialogs()
+        self.toast("正在等待任务清理后退出" if response == "cancel" else "任务完成后将自动退出")
+        self._check_exit()
+
+    def _check_exit(self):
+        if self._exit_mode and not self.manager.busy and not self._operations:
+            self._finish_close()
+
+    def _finish_close(self):
+        if self._closed:
+            return
         self.close_context_menu()
         self._save_session()
-        return False
+        self._closed = True
+        self._cancel_dialogs.set()
+        self._dismiss_dialogs()
+        for ws in self.workspaces:
+            ws.close()
+        self.hub.shutdown()
+        self.manager.shutdown()
+        if self._tick_id:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = 0
+        self.destroy()
 
     # ------------------------------------------------------------------
     # 面板协调
@@ -342,6 +469,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     def restore_session(self):
         """窗口显示后调用: 按记忆恢复标签页."""
+        if self._restored:
+            return
         s = self.settings
         tabs = s.get("tabs") or []
         if not tabs:
@@ -386,22 +515,58 @@ class MainWindow(Adw.ApplicationWindow):
         t.set_timeout(4)
         self.toast_overlay.add_toast(t)
 
-    def blocking_dialog(self, build):
+    def blocking_dialog(self, build, cancel_event=None):
         """从工作线程调用: 在主线程弹一个对话框并阻塞取回结果(≤10 分钟)."""
         ev = threading.Event()
         holder = {}
+        lock = threading.Lock()
 
         def done(value):
-            holder["v"] = value
-            ev.set()
+            with lock:
+                if not ev.is_set():
+                    holder["v"] = value
+                    ev.set()
 
         def show():
-            build(done)
+            if (ev.is_set() or self._cancel_dialogs.is_set()
+                    or (cancel_event is not None and cancel_event.is_set())):
+                done(None)
+                return
+            try:
+                dialog = build(done)
+                self._dialog_waiters[ev] = (dialog, done)
+            except Exception as error:
+                self.toast(f"无法打开确认对话框: {error}", True)
+                done(None)
+
+        def dismiss():
+            active = self._dialog_waiters.pop(ev, None)
+            if active is not None and active[0] is not None and holder.get("cancelled"):
+                active[0].close()
+            return GLib.SOURCE_REMOVE
 
         GLib.idle_add(show)
-        if not ev.wait(timeout=600):
-            return None
+        deadline = time.monotonic() + 600
+        while not ev.wait(0.1):
+            if (self._cancel_dialogs.is_set() or time.monotonic() >= deadline
+                    or (cancel_event is not None and cancel_event.is_set())):
+                holder["cancelled"] = True
+                done(None)
+        GLib.idle_add(dismiss)
         return holder.get("v")
+
+    def _dismiss_dialogs(self):
+        for event, (dialog, done) in list(self._dialog_waiters.items()):
+            if event.is_set():
+                continue
+            done(None)
+            if dialog is not None:
+                dialog.close()
+        self._dialog_waiters.clear()
+
+    def _ask_task_overwrite(self, task, names):
+        return self.blocking_dialog(lambda done: ask_overwrite(self, names, done),
+                                    task.cancel_event)
 
     def _ask_overwrite(self, names):
         """TransferManager 回调(worker 线程): 同名覆盖确认, 阻塞等待."""
@@ -425,7 +590,7 @@ class MainWindow(Adw.ApplicationWindow):
                 if t.move:
                     # 移动后源面板也要刷新
                     for name, st in dict(t.item_status).items():
-                        if st == "committed":
+                        if st in ("committed", "moved", "source_delete_failed"):
                             p = t.top_srcs.get(name)
                             if p:
                                 cwds.add(t.src.parent(p))
@@ -436,8 +601,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_tick(self) -> bool:
         self.transfer_panel.tick()
+        if self._task_center is not None:
+            self._task_center.sync()
+        self._check_disconnects()
         self._update_speed_chip()
-        return GLib.SOURCE_CONTINUE
+        self._check_exit()
+        return GLib.SOURCE_REMOVE if self._closed else GLib.SOURCE_CONTINUE
 
     def _update_speed_chip(self):
         up = down = other = 0

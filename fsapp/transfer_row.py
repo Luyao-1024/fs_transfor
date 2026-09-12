@@ -1,6 +1,8 @@
 """传输面板: 底部可收起面板, 每条传输一行(方向/进度/速度/取消)."""
 from __future__ import annotations
 
+import time
+
 from gi.repository import GLib, Gtk, Pango
 
 from .transfer import DIRECTIONS
@@ -72,7 +74,7 @@ class TransferRow(Gtk.ListBoxRow):
         if self.t.running:
             self.manager.cancel(self.t.id)
         else:
-            self.manager.remove_finished(self.t.id)
+            self.t.notification_hidden = True
 
     def update(self, t):
         label, icon = DIRECTIONS.get(t.direction, ("传输", "emblem-synchronizing-symbolic"))
@@ -129,7 +131,7 @@ class TransferRow(Gtk.ListBoxRow):
                 self.bytes_lbl.set_text(fmt_size(t.done_bytes))
             self.cancel_btn.set_icon_name("process-stop-symbolic")
             self.cancel_btn.set_tooltip_text("取消")
-            self.cancel_btn.set_visible(t.status == "running")
+            self.cancel_btn.set_visible(t.running)
 
 
 class TransferPanel(Gtk.Revealer):
@@ -156,8 +158,12 @@ class TransferPanel(Gtk.Revealer):
         self.set_child(scrolled)
 
     def tick(self) -> bool:
-        self.manager.clear_expired_done(DONE_VISIBLE_SECONDS)
-        transfers = list(self.manager.transfers)
+        now = time.monotonic()
+        for t in self.manager.transfers:
+            if (t.status == "done" and t.finished_at is not None
+                    and now - t.finished_at >= DONE_VISIBLE_SECONDS):
+                t.notification_hidden = True
+        transfers = [t for t in self.manager.transfers if not t.notification_hidden]
 
         # 行同步
         alive = {t.id for t in transfers}
