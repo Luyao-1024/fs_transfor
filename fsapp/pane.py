@@ -15,9 +15,15 @@ from . import config
 from .backend.base import BackendError, CancelledError
 from .backend.local import LocalBackend
 from .connect_dialog import (ConnectDialog, TextPromptDialog, ask_delete,
-                             ask_delete_local, ask_permanent_delete)
+                             ask_delete_local, ask_permanent_delete,
+                             ask_replace)
 from .file_item import FileItem
-from .util import fmt_size
+from .util import fmt_size, validate_item_name
+
+
+def _name_error(name: str) -> str:
+    """新建/重命名只接受一个路径分量: 阻止 '../x' 与 'a/b' 逃出当前目录."""
+    return validate_item_name(name)[1]
 
 
 class ContextMenu(Gtk.Popover):
@@ -1290,16 +1296,24 @@ class FilePane(Gtk.Box):
     def _action_mkdir(self):
         backend, path = self.backend, self.cwd
         TextPromptDialog(self.window, lambda name: self._do_mkdir(name, backend, path),
-                         "新建文件夹", ok_label="创建")
+                         "新建文件夹", ok_label="创建",
+                         validator=_name_error)
 
     def _do_mkdir(self, name, backend=None, path=None):
         if not name:
+            return
+        error = _name_error(name)
+        if error:
+            self.window.toast(f"无法新建文件夹: {error}", True)
             return
         backend = self.backend if backend is None else backend
         path = self.cwd if path is None else path
 
         def op():
-            backend.mkdir(backend.join(path, name))
+            target = backend.join(path, name)
+            if backend.exists(target):
+                raise BackendError(f"同名项目已存在: {name}")
+            backend.mkdir(target)
         self._run_op(op)
 
     def _action_rename(self):
@@ -1310,16 +1324,34 @@ class FilePane(Gtk.Box):
         entry = items[0].entry
         backend, path = self.backend, self.cwd
         TextPromptDialog(self.window, lambda n: self._do_rename(entry, n, backend, path),
-                         "重命名", initial=entry.name, ok_label="重命名")
+                         "重命名", initial=entry.name, ok_label="重命名",
+                         validator=_name_error)
 
     def _do_rename(self, entry, new_name, backend=None, path=None):
-        if not new_name or new_name == entry.name:
+        if not new_name:
+            return
+        error = _name_error(new_name)
+        if error:
+            self.window.toast(f"无法重命名: {error}", True)
             return
         backend = self.backend if backend is None else backend
         path = self.cwd if path is None else path
+        old_path = entry.path
+        if backend.normpath(backend.join(path, new_name)) == backend.normpath(old_path):
+            return                                # 改名后与原名等价: 无操作
 
         def op():
-            backend.rename(entry.path, backend.join(path, new_name))
+            target = backend.join(path, new_name)
+            # rename 在两端都是覆盖式的, 因此替换已有项目必须显式确认
+            if backend.exists(target):
+                if self.window._cancel_dialogs.is_set():
+                    return
+                ok = self.window.blocking_dialog(
+                    lambda done: ask_replace(self.window, new_name, done))
+                if not ok:
+                    GLib.idle_add(self.window.toast, "已取消重命名，未覆盖同名项目")
+                    return
+            backend.rename(old_path, target)
         self._run_op(op)
 
     def _action_delete(self):

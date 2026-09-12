@@ -1,6 +1,7 @@
 """无 GUI 自测: LocalBackend + TransferManager 的核心传输逻辑.
 
-覆盖: 本地↔本地 文件/目录递归复制、空文件、取消、速度计算.
+覆盖: 本地↔本地 文件/目录递归复制、空文件、取消、速度计算、
+执行计划的链接/权限信息、新建与重命名的名称校验.
 运行: .venv/bin/python tests/selftest.py
 """
 import os
@@ -54,6 +55,42 @@ def main():
         check(total == 5000 + 300 * 1024 + 1, f"walk total={total}")  # 含 .hidden 1B
         check(be.basename("/a/b/c.txt") == "c.txt", "basename")
         check(be.parent("/a/b/c.txt") == "/a/b", "parent")
+
+        # ---- 执行计划: 链接与目录分开, 不把链接当目录展开 ----
+        os.makedirs(f"{root}/plan/realdir")
+        with open(f"{root}/plan/realdir/r.txt", "wb") as f:
+            f.write(b"R")
+        with open(f"{root}/plan/plain.txt", "wb") as f:
+            f.write(b"P" * 7)
+        os.symlink("plain.txt", f"{root}/plan/filelink")
+        os.symlink("realdir", f"{root}/plan/dirlink")
+        os.symlink("gone", f"{root}/plan/dangling")
+        plan = be.walk_plan(f"{root}/plan")
+        check({i.rel_path for i in plan.links}
+              == {"filelink", "dirlink", "dangling"},
+              f"walk_plan 单独收集链接 {[i.rel_path for i in plan.links]}")
+        check({i.rel_path for i in plan.files} == {"plain.txt", "realdir/r.txt"},
+              f"walk_plan 不跟随链接展开内容 {[i.rel_path for i in plan.files]}")
+        check(plan.dirs == ["realdir"], f"walk_plan 只收集真实目录 {plan.dirs}")
+        check(plan.total == 8, f"walk_plan 字节量不含链接目标 {plan.total}")
+        check(all(i.mode for i in plan.files), "walk_plan 带上权限位供还原")
+        link_stat = be.lstat(f"{root}/plan/dirlink")
+        check(link_stat is not None and link_stat.is_link and not link_stat.is_dir,
+              "lstat 不把目录链接当目录")
+        check(be.stat(f"{root}/plan/dirlink").is_dir, "stat 仍跟随链接(浏览用)")
+
+        # ---- 名称校验: 阻止新建/重命名路径穿越 ----
+        from fsapp.util import validate_item_name
+        check(validate_item_name("正常文件 名.txt") == ("正常文件 名.txt", ""),
+              "普通名称可用")
+        check(validate_item_name("  a.txt  ")[0] == "a.txt", "首尾空白会被去掉")
+        for bad, why in (("../run", "上级目录"), ("a/b", "子路径"), ("/abs", "绝对路径"),
+                         (".", "当前目录"), ("..", "上级目录"), ("x\ty", "制表符"),
+                         ("", "空白"), ("   ", "全空白")):
+            name, error = validate_item_name(bad)
+            check(bool(error), f"拒绝 {why}: {bad!r} → {error}")
+        check(validate_item_name(".hidden")[1] == "", "隐藏文件名仍然允许")
+        check(validate_item_name("带/斜杠 的名字")[1] != "", "含斜杠一律拒绝")
 
         # ---- 传输: 单文件 ----
         mgr = TransferManager()

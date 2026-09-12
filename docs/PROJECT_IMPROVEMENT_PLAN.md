@@ -394,6 +394,11 @@
 - [x] LIFE-03：退出和取消（2026-09-12，见第 14 节）
 - [x] TASK-01：任务中心与有限历史（2026-09-12；重试粒度与移动边界见第 14 节）
 - [x] UX-01：导航效率（2026-09-12；收藏、面板历史、最近路径、快速筛选及快捷键）
+- [x] SEC-01：主机密钥区分与指纹可读性（2026-09-12，见第 16 节）
+- [x] SAFE-06：新建/重命名名称校验与覆盖策略（2026-09-12，见第 16 节）
+- [x] CORRECT-03：逐项失败隔离（2026-09-12，见第 16 节）
+- [x] CORRECT-04：链接与权限/时间戳保留规则（2026-09-12，见第 16 节）
+- [x] LIFE-04：确认等待不占用工作线程（2026-09-12，见第 16 节）
 - [ ] UX-02：系统剪贴板互通
 - [ ] SSH-01：连接配置和跳板机
 - [ ] ADV-01：断点续传
@@ -540,3 +545,79 @@ UI 截图：[任务中心](screenshots/task-center.png)。截图基于隔离的�
 
 验证结果：`tests/selftest.py`、`transfer_safety.py`、`sftp_contract.py`、`connection_lifecycle.py`、
 `task_management.py` 及全部 13 个 `tests/ui_*.py` 脚本通过（2026-09-12）。
+
+## 16. 主机密钥、名称安全与传输韧性修复（2026-09-12）
+
+范围：SEC-01、SAFE-06、CORRECT-03、CORRECT-04、LIFE-04（代码检视新增编号）。
+本节记录实施结果；实施前的缺陷复现与优先级见同轮检视结论。
+
+### 16.1 任务编号与用户可见行为
+
+- **SEC-01 主机密钥**：`sftp.fingerprint_key()` 输出 OpenSSH 风格 `SHA256:<43 字符>`
+  指纹，可与 `ssh-keygen -lf` 逐字比对（此前是 16 字节 MD5 冒号分组，无法对照）。
+  未知主机仍走首连确认对话框（新增“该主机已记录其他类型密钥”说明）；known_hosts 中
+  同类型密钥被替换时抛出新的 `HostKeyChanged`，弹出只呈现“已记录/本次收到”两个指纹
+  且**只有“拒绝连接”出口**的对话框，不再把 `BadHostKeyException` 的整段 base64 公钥
+  塞进“无法连接 …”提示。`~/.ssh/known_hosts` 缺失时由应用创建（目录 0700、文件 0600）
+  并在用户确认后写回；读写受限只提示不阻断，提示经 Toast 上报。
+- **SAFE-06 名称与覆盖**：`util.validate_item_name()` 只接受单个路径分量，
+  新建文件夹与重命名共用该校验（输入框内即时报错 + 动作层二次兜底），
+  `../x`、`a/b`、`.`、`..`、控制字符一律拒绝；同名新建改为明确报错（此前本地
+  `makedirs(exist_ok=True)` 会静默“成功”）；重命名到已有名称需要“替换”确认，
+  默认取消（两端 rename 都是覆盖式，此前无任何提示）。
+- **CORRECT-03 逐项隔离**：扫描与复制改为“执行计划 + 逐项结果”。单个文件读失败、
+  目录内某项提交失败、悬空/不可读链接都只让该项失败，同任务其余项目继续；
+  只有“一个字节都没提交成功”才把任务判为整体失败，否则报告部分完成并附原因。
+  目录创建失败只影响该子树，且不会覆盖阻挡同名文件。移动语义收紧为“只删除状态为
+  已提交的顶层源”，因此部分完成的目录必然保留源。顺带修掉 `open_read` 失败时误报
+  “临时文件清理失败”（临时文件尚未创建）和错误信息重复拼接源路径的问题。
+- **CORRECT-04 链接与元数据**：`base.walk_plan()` 把目录/普通文件/符号链接分组，
+  链接按 `lstat` 收集不再被解引用展开；传输时优先用同一目标字符串重建链接，
+  目标端明确“不支持”时才退回按内容复制（同名冲突等真实错误仍然上报为该项失败）。
+  文件权限位（含可执行位）与修改时间在提交后尽力还原；目录权限只对本任务新建的目录
+  应用，避免合并进已有目录时改动用户权限。失败计入 `meta_errors` 并在结果里提示，
+  不推翻已提交的内容。属主/属组、ACL、扩展属性、目录 mtime 不在本轮范围。
+- **LIFE-04 确认等待**：同名冲突确认改为 `ask_conflict_async` 非阻塞回调，
+  工作线程立即归还线程池（此前 2 个并发额度可被两个等待确认的任务占满，导致排队任务
+  饿死，并在 `blocking_dialog` 的 600 秒上限处被静默取消）。任务停在 `parked` 状态时
+  仍计入 `busy`，取消任务、断开连接（`check_parked`）与退出清理（`_dismiss_dialogs`）
+  都会以“取消”结束等待；`resolve_conflict` 只接受一次有效答复，迟到答复不会复活
+  已结束的任务。同步钩子 `ask_overwrite`/`ask_conflict` 保留给无 UI 环境。
+
+### 16.2 修改范围
+
+`fsapp/backend/{base,local,sftp}.py`（计划采集、链接/元数据能力、known_hosts、
+异常分类、SFTPAttributes 容错解析）、`fsapp/transfer.py`（执行计划、逐项结果、
+parked 冲突流程）、`fsapp/util.py`（名称校验）、`fsapp/pane.py`（名称与替换动作）、
+`fsapp/connect_dialog.py`（`_KeyDialog` 公共外壳、`HostKeyMismatchDialog`、
+`ask_replace`、输入框校验）、`fsapp/connections.py`（异常分流与写回提示）、
+`fsapp/window.py`（非阻塞确认登记与退出收尾）。删除了无人调用的 `SftpBackend.exec_cmd()`
+（CORRECT-01 禁用快路径后遗留的死代码）。
+
+### 16.3 回归命令与结果
+
+```sh
+for test in tests/selftest.py tests/transfer_safety.py tests/sftp_contract.py \
+            tests/connection_lifecycle.py tests/task_management.py \
+            tests/hostkey_policy.py tests/transfer_resilience.py tests/ui_*.py; do
+    .venv/bin/python "$test" || exit 1
+done
+```
+
+新增 `tests/hostkey_policy.py`、`tests/transfer_resilience.py`、`tests/ui_name_guard.py`、
+`tests/ui_conflict_queue.py`；扩充 `tests/selftest.py`（执行计划与名称校验）、
+`tests/sftp_contract.py`（远端 readlink/symlink/chmod/utime 契约）、
+`tests/ui_widgets.py`（密钥变化对话框无放行入口、输入校验拦截）。
+更新断言：`tests/task_management.py` 改为“后续文件仍然传输”，`tests/ui_shutdown.py`
+改按 `_conflict_dialogs`/`parked` 验证确认取消，`tests/ui_integration.py` 需要显式停用
+非阻塞钩子才会走同步策略。最终结果：7 个核心脚本与全部 15 个 `tests/ui_*.py` 通过
+（2026-09-12）。
+
+### 16.4 未解决限制
+
+主机密钥测试使用 paramiko 替身与临时 `HOME`，未连接真实 SSH 服务器，
+因此密钥轮换、多密钥类型协商与不同 SFTP 服务器扩展支持仍属未验证边界；
+`prepare_known_hosts` 只处理文件缺失/不可写/被目录阻挡，不修改已有条目。
+UX-02 系统剪贴板、SSH-01 跳板机与连接参数、ADV-01 断点续传、ADV-02 差异同步，
+以及第 7.2/7.3/7.4 节其余工程项（面板职责拆分、性能基线、配置类型校验与日志、
+metainfo/CI/i18n）保持待办。

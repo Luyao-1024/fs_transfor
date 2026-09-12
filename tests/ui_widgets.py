@@ -1,4 +1,4 @@
-"""控件级测试: 连接弹出菜单 / 各类对话框构造 / 大文件实时速度 / 传输面板.
+"""控件级测试: 连接弹出菜单 / 主机密钥与名称输入对话框 / 大文件实时速度 / 传输面板.
 
 运行: .venv/bin/python tests/ui_widgets.py   (窗口会在屏幕上短暂出现)
 """
@@ -18,10 +18,22 @@ from gi.repository import Gdk, GLib, GObject, Gtk
 
 from fsapp.application import Application
 from fsapp.connect_dialog import (AuthDialog, ConnectDialog, HostKeyDialog,
-                                  TextPromptDialog, ask_delete, ask_overwrite)
+                                  HostKeyMismatchDialog, TextPromptDialog,
+                                  ask_delete, ask_overwrite, ask_replace)
+from fsapp.util import validate_item_name
 from fsapp.transfer import Transfer
 
 FAILURES = []
+
+
+def walk(w, out=None):
+    out = out if out is not None else []
+    out.append(w)
+    child = w.get_first_child()
+    while child is not None:
+        walk(child, out)
+        child = child.get_next_sibling()
+    return out
 
 
 def check(cond, msg):
@@ -120,6 +132,10 @@ def main():
                                      "新建文件夹"),
             lambda: ask_overwrite(win, ["a.txt"], lambda r: check(r is None, "OverwriteDialog 关闭=取消")),
             lambda: ask_delete(win, ["a.txt"], lambda ok: check(ok is False, "DeleteDialog 关闭=取消")),
+            lambda: HostKeyDialog(win, lambda ok: check(ok is False, "带说明的主机密钥框取消回调"),
+                                  "example.com", "ed25519", "SHA256:UpAKY0V9w",
+                                  "该主机已记录 rsa 密钥(SHA256:other)"),
+            lambda: ask_replace(win, "a.txt", lambda ok: check(ok is False, "ReplaceDialog 关闭=不替换")),
         ]
 
         def run_next(dlg=None):
@@ -132,10 +148,49 @@ def main():
                 d = chain.pop(0)()
                 GLib.timeout_add(450, run_next, d)
             else:
-                GLib.timeout_add(200, step_big_transfer)
+                GLib.timeout_add(200, step_key_guard)
             return GLib.SOURCE_REMOVE
 
         run_next()
+        return GLib.SOURCE_REMOVE
+
+    def step_key_guard():
+        """主机密钥变化必须只给拒绝出口; 名称非法要被拦在输入框内."""
+        win = state["win"]
+
+        results = []
+        dlg = HostKeyMismatchDialog(win, results.append, "example.com", "ed25519",
+                                    "SHA256:recorded", "SHA256 received")
+        buttons = [w.get_label() for w in walk(dlg)
+                   if isinstance(w, Gtk.Button) and w.get_label()]
+        check(not any("信任" in b or "仍然" in b for b in buttons),
+              f"主机密钥变化对话框没有放行按钮({buttons})")
+        check(any("拒绝连接" in b for b in buttons), "变化对话框只提供拒绝连接")
+        labels = [w.get_text() for w in walk(dlg) if isinstance(w, Gtk.Label)]
+        check(any("SHA256:recorded" in t for t in labels)
+              and any("SHA256 received" in t for t in labels),
+              "变化对话框同时展示已记录与实际收到的指纹")
+        check(any("does not match" not in t and "AAAAB3Nza" not in t for t in labels),
+              "对话框不倾倒原始 base64 公钥")
+        deny = [w for w in walk(dlg)
+                if isinstance(w, Gtk.Button) and w.get_label() == "拒绝连接"]
+        deny[0].emit("clicked")
+        check(results == [False], f"拒绝连接按钮返回 False({results})")
+        deny[0].emit("clicked")
+        check(results == [False], "重复点击不会二次回调")
+
+        answers = []
+        prompt = TextPromptDialog(win, answers.append, "新建文件夹", ok_label="创建",
+                                  validator=lambda name: validate_item_name(name)[1])
+        prompt.entry_row.set_text("../escape")
+        prompt._submit()
+        check(not answers and prompt.error_label.get_visible(),
+              "非法名称被拦在对话框内，不会提交")
+        prompt.entry_row.set_text("正常 名称")
+        check(not prompt.error_label.get_visible(), "修改输入后错误提示自动清除")
+        prompt._submit()
+        check(answers == ["正常 名称"], f"合法名称正常返回({answers})")
+        GLib.timeout_add(150, step_big_transfer)
         return GLib.SOURCE_REMOVE
 
     def step_big_transfer():

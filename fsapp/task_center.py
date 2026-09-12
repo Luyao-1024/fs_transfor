@@ -73,7 +73,7 @@ class TaskRow(Adw.ExpanderRow):
         elif active:
             self.progress.set_fraction(self.task.frac)
         total = fmt_size(r["total"]) if r["known"] else "总量未知"
-        text = (f'源：' + "\n".join(r["paths"]) + f'\n目标：{r["dst_dir"]}\n'
+        text = ("源：" + "\n".join(r["paths"]) + f'\n目标：{r["dst_dir"]}\n'
                 f'{"移动" if r["move"] else "复制"} · {r["done_files"]}/{r["files"]} 个文件 · '
                 f'{fmt_size(r["bytes"])} / {total}')
         if r["note"] or r["error"]:

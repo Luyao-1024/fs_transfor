@@ -2,7 +2,7 @@
 # 构建: packaging/build-rpm.sh  (产物在 ~/rpmbuild/RPMS/noarch/)
 Name:           fstransfor
 Version:        0.2.0
-Release:        11%{?dist}
+Release:        12%{?dist}
 Summary:        GTK4 双面板 SSH/SFTP 文件传输器
 License:        MIT
 URL:            https://github.com/Luyao-1024/fs_transfor
@@ -65,6 +65,12 @@ if [ $1 -eq 0 ] && [ -x /usr/bin/gtk4-update-icon-cache ]; then
 fi
 
 %changelog
+* Sat Sep 12 2026 FsTransfor <local@localhost> - 0.2.0-12
+- 主机密钥: OpenSSH SHA256 指纹、密钥被替换时拒绝连接、known_hosts 自动创建与写回
+- 新建/重命名: 单分量名称校验(阻止 ../ 与 a/b)、同名新建报错、替换需二次确认
+- 传输: 单项失败只影响该项并继续同任务其余文件; 符号链接原样重建; 权限与时间戳保留
+- 传输: 同名覆盖确认改为非阻塞回调, 等待确认不再占用并发额度
+
 * Fri Sep 11 2026 FsTransfor <local@localhost> - 0.2.0-11
 - Add custom names and renaming for path bookmarks
 

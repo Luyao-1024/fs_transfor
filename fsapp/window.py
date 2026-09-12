@@ -67,8 +67,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.local_backend = LocalBackend()
         self.hub = ConnectionHub(self)
         self.manager = TransferManager(self.hub)
-        self.manager.ask_overwrite = self._ask_overwrite
-        self.manager.ask_conflict = self._ask_task_overwrite
+        # 同名冲突走非阻塞回调: 等待确认期间不占用传输工作线程
+        self.manager.ask_conflict_async = self._ask_conflict_async
         self.manager.add_listener(self._on_manager_changed)
         self._drag_payloads: dict = {}
         self._clip: tuple | None = None  # (backend, src_dir, paths, 'copy'|'cut')
@@ -78,6 +78,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._closed = False
         self._cancel_dialogs = threading.Event()
         self._dialog_waiters = {}
+        self._conflict_dialogs: dict[int, tuple] = {}   # 任务 id -> (对话框, 结束回调)
         self._operations = set()
         self._task_center = None
         self._disconnecting = set()
@@ -556,6 +557,11 @@ class MainWindow(Adw.ApplicationWindow):
         return holder.get("v")
 
     def _dismiss_dialogs(self):
+        for tid, (dialog, finish) in list(self._conflict_dialogs.items()):
+            self._conflict_dialogs.pop(tid, None)
+            finish(None)          # 任务按取消收尾
+            if dialog is not None:
+                dialog.close()
         for event, (dialog, done) in list(self._dialog_waiters.items()):
             if event.is_set():
                 continue
@@ -564,14 +570,31 @@ class MainWindow(Adw.ApplicationWindow):
                 dialog.close()
         self._dialog_waiters.clear()
 
-    def _ask_task_overwrite(self, task, names):
-        return self.blocking_dialog(lambda done: ask_overwrite(self, names, done),
-                                    task.cancel_event)
+    def _ask_conflict_async(self, task, names, done):
+        """同名覆盖确认(非阻塞): 答复后由 TransferManager 重新入队续跑.
 
-    def _ask_overwrite(self, names):
-        """TransferManager 回调(worker 线程): 同名覆盖确认, 阻塞等待."""
-        return self.blocking_dialog(
-            lambda done: ask_overwrite(self, names, done))
+        工作线程此刻已经释放, 所以停在确认框上的任务不会占满并发额度;
+        取消任务、断开连接或退出应用都会以 None(=取消)结束这次等待。
+        """
+        def show():
+            if (self._closed or task.ended_at is not None
+                    or self._cancel_dialogs.is_set() or task.cancel_event.is_set()):
+                done(None)
+                return False
+
+            def finish(answer):
+                self._conflict_dialogs.pop(task.id, None)
+                done(answer)
+
+            try:
+                dialog = ask_overwrite(self, names, finish)
+            except Exception as error:
+                self.toast(f"无法打开确认对话框: {error}", True)
+                done(None)
+                return False
+            self._conflict_dialogs[task.id] = (dialog, finish)
+            return False
+        GLib.idle_add(show)
 
     # ------------------------------------------------------------------
     # 传输事件
@@ -600,6 +623,7 @@ class MainWindow(Adw.ApplicationWindow):
                             pane.refresh()
 
     def _on_tick(self) -> bool:
+        self.manager.check_parked()
         self.transfer_panel.tick()
         if self._task_center is not None:
             self._task_center.sync()

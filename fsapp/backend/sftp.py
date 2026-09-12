@@ -1,12 +1,15 @@
 """SFTP 远程后端 (paramiko 封装).
 
-- 连接/认证在 worker 线程执行; 未知主机抛 HostKeyUnknown, 缺凭据抛 AuthNeeded,
-  由 UI 层弹框后重试.
+- 连接/认证在 worker 线程执行; 未知主机抛 HostKeyUnknown, 主机密钥被替换抛
+  HostKeyChanged(绝不自动接受), 缺凭据抛 AuthNeeded, 由 UI 层弹框后处理.
+- known_hosts 缺失时创建(0700/0600)并写回用户确认的密钥; 读写受限只提示不阻断.
 - 所有 SFTP 操作持连接级锁; 大文件按块读写, 每块持锁,
   因此同一连接上的多个任务按块交错推进(安全且各自有进度).
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import posixpath
 import stat as stat_mod
@@ -19,14 +22,40 @@ from .base import BaseBackend, BackendError, FileEntry, perms_str
 DEFAULT_KEY_NAMES = ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa")
 
 
-class HostKeyUnknown(Exception):
-    """主机密钥不在 known_hosts 中, 携带指纹供用户确认."""
+def fingerprint_key(key) -> str:
+    """OpenSSH 风格 SHA256 指纹, 可与 ssh/ssh-keygen 输出直接比对."""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
-    def __init__(self, key):
+
+class HostKeyUnknown(Exception):
+    """主机密钥不在 known_hosts 中, 携带指纹供用户确认.
+
+    note 非空表示该主机已有其他类型的记录(密钥类型升级), 确认时需一并展示.
+    """
+
+    def __init__(self, key, hostname: str = "", note: str = ""):
         super().__init__("host key unknown")
         self.key = key
-        self.fingerprint = ":".join(f"{b:02x}" for b in key.get_fingerprint())
+        self.hostname = hostname
+        self.note = note
+        self.fingerprint = fingerprint_key(key)
         self.key_type = key.get_name()
+
+
+class HostKeyChanged(Exception):
+    """known_hosts 中同类型密钥与服务器提供的不一致: 密钥轮换或中间人.
+
+    安全策略: 绝不自动接受, 也不提供"这次相信"入口; 只能拒绝并由用户
+    人工核对后更新 known_hosts。
+    """
+
+    def __init__(self, hostname: str, key_type: str, expected: str, got: str):
+        super().__init__(f"{hostname} 的主机密钥与已知记录不一致")
+        self.hostname = hostname
+        self.key_type = key_type
+        self.expected = expected
+        self.got = got
 
 
 class AuthNeeded(Exception):
@@ -41,7 +70,25 @@ class _RejectUnknown(paramiko.MissingHostKeyPolicy):
     """未知主机密钥: 不静默接受, 抛出供 UI 确认."""
 
     def missing_host_key(self, client, hostname, key):
-        raise HostKeyUnknown(key)
+        raise HostKeyUnknown(key, hostname)
+
+
+def prepare_known_hosts(path: str) -> str:
+    """确保 ~/.ssh 与 known_hosts 存在(0700/0600); 返回错误说明('' = 成功)."""
+    try:
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        if os.path.isdir(path):
+            return f"{path} 是一个目录, 无法作为 known_hosts 使用"
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+        if not os.access(path, os.R_OK | os.W_OK):
+            return f"{path} 不可读写, 新确认的主机密钥不会被保存"
+    except OSError as e:
+        return f"无法准备 {path}: {e.strerror or e}"
+    return ""
 
 
 class _LockedFile:
@@ -74,6 +121,7 @@ class _LockedFile:
 
 class SftpBackend(BaseBackend):
     is_local = False
+    supports_links = True    # 服务器不支持时具体调用会抛错, 传输层按内容回退
 
     def __init__(self, host, port=22, username=None, auth_method="key",
                  key_path=None, password=None, passphrase=None):
@@ -88,6 +136,7 @@ class SftpBackend(BaseBackend):
         self.sftp: paramiko.SFTPClient | None = None
         self._lock = threading.RLock()
         self._home: str | None = None
+        self.host_key_note = ""
 
     @property
     def label(self):
@@ -100,15 +149,21 @@ class SftpBackend(BaseBackend):
     def connect(self, accepted_key=None):
         """阻塞连接. accepted_key: 用户已确认的主机密钥(首连确认后传入).
 
-        抛出: HostKeyUnknown / AuthNeeded / BackendError.
+        抛出: HostKeyUnknown(新密钥待确认) / HostKeyChanged(已记录密钥被替换,
+        只能拒绝) / AuthNeeded / BackendError. 读写 known_hosts 受阻不抛异常,
+        而是记录到 self.host_key_note 供 UI 提示。
         """
         client = paramiko.SSHClient()
+        self.host_key_note = ""
         kh = os.path.expanduser("~/.ssh/known_hosts")
-        if os.path.exists(kh):
+        note = prepare_known_hosts(kh)
+        if note:
+            self.host_key_note = note
+        else:
             try:
                 client.load_host_keys(kh)  # 可写加载: 新密钥可保存回文件
-            except (IOError, OSError):
-                pass
+            except (IOError, OSError) as e:
+                self.host_key_note = f"无法读取 {kh}: {e}"
         client.set_missing_host_key_policy(_RejectUnknown())
 
         if accepted_key is not None:
@@ -123,6 +178,9 @@ class SftpBackend(BaseBackend):
         except paramiko.AuthenticationException:
             client.close()
             raise AuthNeeded("both", "认证失败: 可重试密钥口令, 或输入登录密码") from None
+        except paramiko.BadHostKeyException as e:
+            client.close()
+            raise self._host_key_error(e) from None
         except paramiko.SSHException as e:
             client.close()
             raise BackendError(f"无法连接 {self.host}:{self.port} — {e}") from None
@@ -130,11 +188,11 @@ class SftpBackend(BaseBackend):
             client.close()
             raise BackendError(f"无法连接 {self.host}:{self.port} — {e}") from None
 
-        if accepted_key is not None and os.path.exists(kh):
+        if accepted_key is not None:
             try:
                 client.save_host_keys(kh)
-            except (IOError, OSError):
-                pass
+            except (IOError, OSError) as e:
+                self.host_key_note = f"主机密钥未能写入 {kh}: {e}"
 
         self.client = client
         transport = client.get_transport()
@@ -146,6 +204,28 @@ class SftpBackend(BaseBackend):
         except paramiko.SSHException as e:
             client.close()
             raise BackendError(f"打开 SFTP 会话失败: {e}") from None
+
+    def _host_key_error(self, error):
+        """把 paramiko 的密钥异常分成两类: 新密钥待确认 / 同类型密钥被替换.
+
+        类型不同通常是服务器新增了一种主机密钥, 仍按首连确认处理;
+        类型相同而内容不同才是不一致, 必须拒绝而不是让用户"这次相信"。
+        """
+        # paramiko 5 用 .key 表示服务器提供的密钥(旧版叫 server_key)
+        server = getattr(error, "key", None) or getattr(error, "server_key", None)
+        expected = getattr(error, "expected_key", None)
+        got_type = server.get_name() if server is not None else ""
+        if expected is not None and server is not None and \
+                expected.get_name() != got_type:
+            return HostKeyUnknown(
+                server, self.host,
+                note=f"该主机已记录 {expected.get_name().replace('ssh-', '')} "
+                     f"密钥({fingerprint_key(expected)}); 服务器同时提供了新的密钥类型")
+        return HostKeyChanged(
+            self.host,
+            got_type.replace("ssh-", ""),
+            fingerprint_key(expected) if expected is not None else "无记录",
+            fingerprint_key(server) if server is not None else "无记录")
 
     def _do_connect(self, client):
         kw = dict(
@@ -216,19 +296,25 @@ class SftpBackend(BaseBackend):
             except (OSError, paramiko.SSHException, EOFError) as e:
                 self._check_alive()
                 raise BackendError(self._errmsg(e)) from None
-        out = []
-        for a in attrs:
-            mode = a.st_mode or 0
-            out.append(FileEntry(
-                name=a.filename,
-                path=self.join(path, a.filename),
-                size=a.st_size or 0,
-                mtime=a.st_mtime or 0.0,
-                is_dir=stat_mod.S_ISDIR(mode),
-                perms=perms_str(mode),
-                is_link=stat_mod.S_ISLNK(mode),
-            ))
-        return out
+        return [self._entry(self.join(path, a.filename), a) for a in attrs]
+
+    def _entry(self, path, attrs) -> FileEntry:
+        """SFTPAttributes → FileEntry.
+
+        服务器可能省略 size/mtime 等字段(甚至只回 mode), 因此全部按缺省取,
+        不能假设字段一定存在。
+        """
+        mode = int(getattr(attrs, "st_mode", 0) or 0)
+        return FileEntry(
+            name=self.basename(path),
+            path=self.normpath(path),
+            size=int(getattr(attrs, "st_size", 0) or 0),
+            mtime=float(getattr(attrs, "st_mtime", 0.0) or 0.0),
+            is_dir=stat_mod.S_ISDIR(mode),
+            perms=perms_str(mode),
+            is_link=stat_mod.S_ISLNK(mode),
+            mode=mode,
+        )
 
     def stat(self, path):
         self._check()
@@ -240,15 +326,20 @@ class SftpBackend(BaseBackend):
             except (OSError, paramiko.SSHException, EOFError) as e:
                 self._check_alive()
                 raise BackendError(self._errmsg(e)) from None
-        mode = a.st_mode or 0
-        return FileEntry(
-            name=self.basename(path),
-            path=self.normpath(path),
-            size=a.st_size or 0,
-            mtime=a.st_mtime or 0.0,
-            is_dir=stat_mod.S_ISDIR(mode),
-            perms=perms_str(mode),
-        )
+        return self._entry(path, a)
+
+    def lstat(self, path):
+        """不跟随链接的 stat: 传输层据此区分链接/目录/普通文件."""
+        self._check()
+        with self._lock:
+            try:
+                a = self.sftp.lstat(path)
+            except FileNotFoundError:
+                return None
+            except (OSError, paramiko.SSHException, EOFError) as e:
+                self._check_alive()
+                raise BackendError(self._errmsg(e)) from None
+        return self._entry(path, a)
 
     def exists(self, path):
         try:
@@ -316,6 +407,44 @@ class SftpBackend(BaseBackend):
         except (OSError, paramiko.SSHException, EOFError) as e:
             self._check_alive()
             raise BackendError(f"删除 {path} 失败: {self._errmsg(e)}") from None
+
+    def read_link(self, path):
+        self._check()
+        with self._lock:
+            try:
+                return self._fsname(self.sftp.readlink(path))
+            except (OSError, paramiko.SSHException, EOFError) as e:
+                self._check_alive()
+                raise BackendError(f"读取链接失败: {self._errmsg(e)}") from None
+
+    def make_symlink(self, target, path):
+        self._check()
+        with self._lock:
+            try:
+                self.sftp.symlink(target, path)
+            except (OSError, paramiko.SSHException, EOFError) as e:
+                self._check_alive()
+                raise BackendError(f"创建符号链接失败: {self._errmsg(e)}") from None
+
+    def set_metadata(self, path, mode=None, mtime=None):
+        """尽力还原权限与修改时间; 链接权限会被服务器跟随, 因此跳过."""
+        self._check()
+        with self._lock:
+            try:
+                if mode:
+                    self.sftp.chmod(path, stat_mod.S_IMODE(mode))
+                if mtime is not None:
+                    self.sftp.utime(path, (int(mtime), int(mtime)))
+            except (OSError, paramiko.SSHException, EOFError) as e:
+                self._check_alive()
+                raise BackendError(f"保留权限/时间戳失败: {self._errmsg(e)}") from None
+
+    @staticmethod
+    def _fsname(value) -> str:
+        """SFTP readlink 可能返回 bytes: 统一成 str 供 symlink 使用."""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        return str(value)
 
     def rename(self, old, new):
         self._check()
@@ -404,13 +533,3 @@ class SftpBackend(BaseBackend):
             return temp
         return None
 
-    def exec_cmd(self, cmd):
-        """在独立 channel 上执行命令, 立即返回 channel(不持锁)."""
-        self._check()
-        t = self.client.get_transport()
-        if t is None:
-            raise BackendError("未连接")
-        chan = t.open_session()
-        chan.settimeout(60)
-        chan.exec_command(cmd)
-        return chan

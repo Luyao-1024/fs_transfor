@@ -11,8 +11,8 @@ import threading
 from gi.repository import GLib
 
 from .backend.base import BackendError
-from .backend.sftp import AuthNeeded, HostKeyUnknown, SftpBackend
-from .connect_dialog import AuthDialog, HostKeyDialog
+from .backend.sftp import AuthNeeded, HostKeyChanged, HostKeyUnknown, SftpBackend
+from .connect_dialog import AuthDialog, HostKeyDialog, HostKeyMismatchDialog
 
 MAX_CONNECT_RETRIES = 8
 
@@ -99,12 +99,23 @@ class ConnectionHub:
                 except HostKeyUnknown as e:
                     ok = self._request_dialog(cfg, request,
                         lambda done, _e=e: HostKeyDialog(
-                            self.window, done, backend.host,
-                            _e.key_type.replace("ssh-", ""), _e.fingerprint))
+                            self.window, done, _e.hostname or backend.host,
+                            _e.key_type.replace("ssh-", ""), _e.fingerprint,
+                            _e.note))
                     if not ok:
                         self._dispatch_fail(cfg, "已拒绝主机密钥", request)
                         return
                     accepted = e.key
+                except HostKeyChanged as e:
+                    # 已记录的同类型密钥被替换: 只呈现证据, 不提供"仍然连接"
+                    self._request_dialog(cfg, request,
+                        lambda done, _e=e: HostKeyMismatchDialog(
+                            self.window, done, _e.hostname or backend.host,
+                            _e.key_type, _e.expected, _e.got))
+                    self._dispatch_fail(cfg, (
+                        f"{e.hostname or backend.host} 的主机密钥与 known_hosts 不一致，"
+                        "已拒绝连接。请核对指纹后再更新该条目。"), request)
+                    return
                 except AuthNeeded as e:
                     got = self._request_dialog(cfg, request,
                         lambda done, _e=e: AuthDialog(self.window, done, _e.kind, str(_e)))
@@ -165,6 +176,9 @@ class ConnectionHub:
             _safe_disconnect(backend)
             return GLib.SOURCE_REMOVE
         waiters = self._pending.pop(key, [])
+        if getattr(backend, "host_key_note", ""):
+            # known_hosts 读写受限: 连接仍可用, 但新确认的密钥不会被记住
+            GLib.idle_add(self.window.toast, backend.host_key_note, True)
         entry = _Entry(backend, cfg)
         self._live[key] = entry
         for pane, path, on_done in waiters:

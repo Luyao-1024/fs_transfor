@@ -1,25 +1,50 @@
-"""传输调度: 统一块复制 + 递归目录 + 滚动速度计算 + 临时文件安全提交.
+"""传输调度: 执行计划 + 逐项结果 + 临时文件安全提交 + 滚动速度计算.
 
 方向无关: 本地↔本地 / 本地↔远端 / 远端↔远端 走同一套流式复制;
-文件先写入目标目录的任务专属临时文件, 成功后原子提交 —— 取消/失败
-只清理临时文件, 已有目标文件全程不变; 移动语义在核心层: 只有完整
-提交的项目才删除源(跳过/失败/取消一律保留源).
+先扫描出执行计划(目录树 / 普通文件 / 符号链接), 再逐项写入目标目录的
+任务专属临时文件并原子提交:
+- 单个项目失败只记入该项的逐项结果, 同任务其余项目继续;
+- 权限位与修改时间尽力还原, 符号链接原样重建(目标端不支持才按内容复制);
+- 只有完整提交成功的顶层条目才删除源(跳过/失败/取消一律保留源);
+- 同名冲突确认交给主线程后释放工作线程, 等待确认不占用并发额度.
 """
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 from gi.repository import GLib
 
-from .backend.base import BackendError, CancelledError
+from .backend.base import BackendError, CancelledError, TransferItem
 
 CHUNK = 512 * 1024      # 复制块大小
 SPEED_WINDOW = 2.0      # 速度滚动窗口(秒)
 MAX_WORKERS = 2         # 并行传输数
+
+PARKED = object()       # 冲突确认已交给主线程, 工作线程可以释放
+
+# 目标端拒绝创建链接(而非同名冲突)时的错误特征: 允许回退成内容复制
+_UNSUPPORTED = re.compile(r"not supported|unsupported|not implemented"
+                          r"|operation not supported|不支持", re.IGNORECASE)
+
+
+@dataclass
+class _Job:
+    """运行期执行计划(仅内存, 不写历史)."""
+    dirs: list[str] = field(default_factory=list)
+    dir_modes: dict[str, int] = field(default_factory=dict)
+    items: list[TransferItem] = field(default_factory=list)
+    dead: set[str] = field(default_factory=set)        # 扫描即失败的顶层条目
+    skipped: set[str] = field(default_factory=set)     # 用户选择跳过的条目
+
+    def add_item(self, item: TransferItem):
+        self.items.append(item)
+
 
 DIRECTIONS = {
     "copy": ("复制", "edit-copy-symbolic"),
@@ -63,6 +88,13 @@ class Transfer:
         self.finished_at: float | None = None
         self.cancel_event = threading.Event()
         self.connection_error = ""
+        # 执行计划与冲突等待(运行期状态, 不进历史)
+        self.plan: _Job | None = None
+        self.parked = False         # 等待用户确认: 不占用工作线程
+        self.conflict_names: list[str] = []
+        self.meta_errors = 0        # 权限/时间戳保留失败计数(只提示)
+        self._apply_lock = threading.Lock()
+        self.applying = False
         # 逐顶层条目结果与源路径映射(移动删源依据): 主线程只读快照
         self.item_status: dict[str, str] = {}   # 顶层名 → pending/committed/skipped
         self.top_srcs: dict[str, str] = {}      # 顶层名 → 源路径
@@ -116,8 +148,9 @@ class TransferManager:
         self.transfers: list[Transfer] = []
         self._pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="transfer")
         self._listeners: list = []          # fn(): 在主线程被调用
-        self.ask_overwrite = None           # UI 注册: (names) -> 'overwrite'|'skip'|None
-        self.ask_conflict = None            # (transfer, names), 可取消的 UI 等待
+        self.ask_overwrite = None           # 同步钩子: (names) -> 'overwrite'|'skip'|None
+        self.ask_conflict = None            # 同步钩子: (transfer, names), 可取消等待
+        self.ask_conflict_async = None      # UI 注册: (transfer, names, done) 非阻塞
         self.accepting = True
         self.history = None
 
@@ -218,6 +251,9 @@ class TransferManager:
                 if not t.running:
                     return False
                 t.cancel_event.set()
+                if t.parked:
+                    # 停在确认框上的任务没有占用 worker, 直接按取消收尾
+                    return self.resolve_conflict(t.id, None)
                 if t.future is not None and t.future.cancel():
                     t.status = "error" if t.connection_error else "cancelled"
                     t.error = t.connection_error
@@ -227,6 +263,15 @@ class TransferManager:
                 self._notify()
                 return True
         return False
+
+    def check_parked(self) -> bool:
+        """主线程定时检查: 取消/断连可以立刻结束等待确认的任务."""
+        changed = False
+        for t in list(self.transfers):
+            if t.parked and (t.cancel_event.is_set() or t.connection_error):
+                self.resolve_conflict(t.id, None)
+                changed = True
+        return changed
 
     def clear_finished(self):
         self.transfers = [t for t in self.transfers
@@ -337,48 +382,89 @@ class TransferManager:
 
     # ------------------------------------------------------------------
     def _run(self, t: Transfer):
-        t.status = "running"
-        t.phase = "scanning"
-        self._notify()
+        """工作线程入口: 扫描 → 冲突确认 → 执行 → 统一收尾.
+
+        冲突确认交给主线程时立即返回, worker 回到池里继续跑其他任务;
+        用户答复后由 resolve_conflict 重新入队续跑, 因此停在确认框上的
+        任务不会把并发额度占满(排队饿死), 也不再受对话框超时影响。
+        """
+        if t.plan is None:
+            t.status = "running"
+            t.phase = "scanning"
+            self._notify()
+            try:
+                t.plan = self._collect(t)
+            except CancelledError:
+                return self._settle(t, "cancelled")
+            except Exception as e:
+                t.error = t.error or _reason(e)
+                return self._settle(t, "error")
+            if self._request_conflicts(t) is PARKED:
+                return
+        with t._apply_lock:
+            if t.applying:
+                return
+            t.applying = True
         try:
-            self._execute(t)
-            status = "done"
+            self._apply_plan(t)
+            status = "partial" if t.item_errors else "done"
             if t.move:
                 t.phase = "deleting_source"
                 self._notify()
                 if not self._delete_moved_sources(t):
                     status = "partial"
                 elif any(s == "skipped" for s in dict(t.item_status).values()):
-                    status = "partial"   # 有跳过: 部分源保留
-            t.status = status
+                    status = "partial"      # 有跳过: 部分源保留
+            self._settle(t, status)
         except CancelledError:
-            t.status = "cancelled"
+            self._settle(t, "cancelled")
         except Exception as e:
-            t.status = "error"
-            t.error = str(e) or e.__class__.__name__
-        finally:
-            if t.connection_error:
-                t.status = "error"
-                t.error = t.connection_error
-            for name, status in list(t.item_status.items()):
-                if status == "pending":
-                    t.item_status[name] = "cancelled" if t.status == "cancelled" else "error"
-                    t.item_errors[name] = t.error or "未完成"
-            if t.status == "error" and "committed" in t.item_status.values():
-                t.status = "partial"
-            t.speed = 0.0
-            t.finished_at = time.monotonic()
-            t.ended_at = time.time()
-            GLib.idle_add(self._finish, t)
+            t.error = t.error or _reason(e)
+            self._settle(t, "error")
+
+    def _settle(self, t: Transfer, status: str):
+        """统一收尾: 修正逐项状态、汇总 note/error, 安排主线程释放资源."""
+        if t.ended_at is not None:
+            return
+        if t.connection_error:
+            status, t.error = "error", t.connection_error
+        fallback = t.error or ("已取消" if status == "cancelled" else "未完成")
+        for name, state in list(t.item_status.items()):
+            if state == "pending":
+                t.item_status[name] = "cancelled" if status == "cancelled" else "error"
+                t.item_errors.setdefault(name, fallback)
+        if status == "error" and "committed" in t.item_status.values():
+            status = "partial"
+        skipped = sum(1 for state in t.item_status.values() if state == "skipped")
+        if skipped and not t.move and "跳过" not in t.note:
+            # 复制时"跳过"是用户的选择, 不算失败, 但要能解释为什么没写目标
+            t.note = (t.note + "，" if t.note else "") + f"跳过 {skipped} 项(目标保持原样)"
+        if t.meta_errors:
+            t.note = (t.note + "，" if t.note else "") + \
+                f"{t.meta_errors} 项权限/时间戳未能保留"
+        t.status = status
+        t.phase = "finished"
+        t.parked = False
+        t.speed = 0.0
+        t.finished_at = time.monotonic()
+        t.ended_at = time.time()
+        GLib.idle_add(self._finish, t)
+        return None
 
     def _delete_moved_sources(self, t: Transfer) -> bool:
-        """移动语义: 仅删除已完整提交的顶层源; 目录内任一子项跳过/失败
-        时整个源条目已在冲突/异常路径保留. 返回 True=全部删除成功."""
+        """移动语义: 只删除完整提交成功的顶层源.
+
+        跳过、失败、未完成的顶层条目一律保留源; 目录内任一子项失败时该
+        顶层条目也不删源。返回 True = 应删除的源全部删除成功.
+        """
         ok = True
-        moved = skipped = del_failed = 0
-        for name, st in dict(t.item_status).items():
-            if st == "skipped":
+        moved = skipped = retained = del_failed = 0
+        for name, state in dict(t.item_status).items():
+            if state == "skipped":
                 skipped += 1
+                continue
+            if state != "committed":
+                retained += 1
                 continue
             p = t.top_srcs.get(name)
             if p is None:
@@ -395,117 +481,265 @@ class TransferManager:
                 msg = f"{name}: 复制成功，源删除失败 ({e})"
                 t.item_status[name] = "source_delete_failed"
                 t.item_errors[name] = msg
-                t.error = f"{t.error}; {msg}" if t.error else msg
+                _append_error(t, msg)
         parts = [f"已移动 {moved} 项"]
         if skipped:
             parts.append(f"跳过 {skipped} 项")
+        if retained:
+            parts.append(f"{retained} 项源保留(失败或未完成)")
         if del_failed:
             parts.append(f"{del_failed} 项源删除失败")
         t.note = "，".join(parts)
         return ok
 
-    def _execute(self, t: Transfer):
-        src, dst = t.src, t.dst
-
-        dirs, files, total, top = self._collect(t)
-        self._check_conflicts(t, files, dirs, top)
-
-        t.total_bytes = sum(size for _, _, size in files)
-        t.file_count = len(files)
-        t.total_known = True
-        t.phase = "transferring"
-        self._notify()
-        if t.cancel_event.is_set():
-            raise CancelledError("已取消")
-
-        # 确保目标目录本身存在(面板 cwd 正常时已存在, 这里兜底)
-        self._mkdir_checked(dst, t.dst_dir, "目标目录")
-        for d in dirs:
-            if t.cancel_event.is_set():
-                raise CancelledError("已取消")
-            self._mkdir_checked(dst, dst.join(t.dst_dir, d), f"创建目录 {d}")
-
-        remaining = {}
-        for _, rel, _ in files:
-            name = rel.split("/", 1)[0]
-            remaining[name] = remaining.get(name, 0) + 1
-        for name, status in list(t.item_status.items()):
-            if status == "pending" and name not in remaining:
-                t.item_status[name] = "committed"
-        for src_path, rel, _size in files:
-            if t.cancel_event.is_set():
-                raise CancelledError("已取消")
-            self._copy_file(t, src_path, dst.join(t.dst_dir, rel))
-            t.done_files += 1
-            name = rel.split("/", 1)[0]
-            remaining[name] -= 1
-            if remaining[name] == 0:
-                t.item_status[name] = "committed"
-
-        for name, st in dict(t.item_status).items():
-            if st == "pending":
-                t.item_status[name] = "committed"
-
     # ------------------------------------------------------------------
-    def _collect(self, t: Transfer):
-        """展开源: (相对目录, [(绝对路径, 相对路径, 大小)], 总字节, 顶层名)."""
+    # 扫描与执行计划
+    # ------------------------------------------------------------------
+    def _collect(self, t: Transfer) -> _Job:
+        """展开源为执行计划; 单项读取失败只记录, 不牵连同批其他项."""
         src = t.src
-        dirs: list[str] = []
-        files: list[tuple[str, str, int]] = []
-        total = 0
-        top: list[str] = []
+        job = _Job()
         for p in t.src_paths:
             name = src.basename(p)
             t.top_srcs[name] = p
             t.item_status[name] = "pending"
         for p in t.src_paths:
-            if t.cancel_event.is_set():
-                raise CancelledError("已取消")
-            st = src.stat(p)
+            self._check_cancel(t)
+            name = src.basename(p)
+            try:
+                st = src.lstat(p)
+            except BackendError as e:
+                self._fail_top(t, job, name, f"源无法访问: {e}")
+                continue
             if st is None:
-                raise BackendError(f"源项目已不存在: {p}")
-            base = src.basename(p)
-            top.append(base)
-            t.top_srcs[base] = p
-            t.item_status[base] = "pending"
-            if st.is_dir:
-                dirs.append(base)   # 顶层目录自身也要在目标端创建(空目录不再假成功)
-                ds, fs, tt = src.walk(p, cancel_event=t.cancel_event)
-                dirs.extend(f"{base}/{d}" for d in ds)
-                files.extend((s, f"{base}/{r}", z) for s, r, z in fs)
-                total += tt
+                self._fail_top(t, job, name, f"源项目已不存在: {name}")
+                continue
+            if st.is_link and not st.is_dir:
+                job.add_item(TransferItem(p, name, 0, st.mode, st.mtime,
+                                          is_link=True))
+            elif st.is_dir:
+                self._absorb(t, job, name, st.mode,
+                             src.walk_plan(p, t.cancel_event))
             else:
-                files.append((p, base, st.size))
-                total += st.size
-        return dirs, files, total, top
+                job.add_item(TransferItem(p, name, st.size, st.mode, st.mtime))
+        if job.dead and not (set(t.top_srcs) - job.dead):
+            raise BackendError(t.error or "没有可传输的项目")
+        return job
 
-    def _check_conflicts(self, t, files, dirs, top):
-        if self.ask_overwrite is None and self.ask_conflict is None:
-            return
+    @staticmethod
+    def _absorb(t: Transfer, job: _Job, top: str, top_mode: int, walked):
+        """把 walk_plan 结果并入任务计划(相对路径加顶层目录前缀)."""
+        job.dirs.append(top)
+        job.dir_modes[top] = top_mode
+        for d in walked.dirs:
+            job.dirs.append(f"{top}/{d}")
+        for rel, mode in walked.dir_modes.items():
+            job.dir_modes[f"{top}/{rel}"] = mode
+        for item in walked.files:
+            job.add_item(TransferItem(item.src_path, f"{top}/{item.rel_path}",
+                                      item.size, item.mode, item.mtime))
+        for item in walked.links:
+            job.add_item(TransferItem(item.src_path, f"{top}/{item.rel_path}",
+                                      0, item.mode, item.mtime, is_link=True))
+
+    def _fail_top(self, t: Transfer, job: _Job, name: str, message: str):
+        """顶层条目整体不可用: 记入逐项结果并排除其全部内容."""
+        job.dead.add(name)
+        t.item_status[name] = "error"
+        t.item_errors[name] = message
+        _append_error(t, f"{name}: {message}")
+
+    # ------------------------------------------------------------------
+    # 同名冲突
+    # ------------------------------------------------------------------
+    def _request_conflicts(self, t: Transfer):
+        """确认顶层同名冲突; 返回 PARKED 表示已交给主线程处理."""
         dst = t.dst
         conflicts = []
-        for name in top:
+        for name in t.top_srcs:
+            if name in t.plan.dead or name in t.plan.skipped:
+                continue
             try:
                 if dst.exists(dst.join(t.dst_dir, name)):
                     conflicts.append(name)
             except Exception:
-                pass
+                continue        # 探测失败交给写入阶段报出真实原因
         if not conflicts:
-            return
+            return None
         t.phase = "waiting"
+        t.conflict_names = conflicts
         self._notify()
+        if self.ask_conflict_async is not None:
+            t.parked = True
+            self.ask_conflict_async(t, conflicts,
+                                    lambda answer: self.resolve_conflict(t.id, answer))
+            return PARKED
+        if self.ask_conflict is None and self.ask_overwrite is None:
+            return None
+        # 同步钩子(headless 与测试): 沿用阻塞式等待语义
         answer = (self.ask_conflict(t, conflicts) if self.ask_conflict is not None
                   else self.ask_overwrite(conflicts))
         if answer is None:
             raise CancelledError("已取消")
         if answer == "skip":
-            skip = set(conflicts)
-            files[:] = [(s, r, z) for s, r, z in files if r.split("/", 1)[0] not in skip]
-            dirs[:] = [d for d in dirs if d.split("/", 1)[0] not in skip]
-            for name in skip:
-                if t.item_status.get(name) == "pending":
-                    t.item_status[name] = "skipped"
+            self._skip_names(t, conflicts)
+        return None
 
+    def resolve_conflict(self, tid: int, answer) -> bool:
+        """主线程回调: 应用冲突决定, 然后让任务继续或按取消收尾."""
+        t = next((x for x in self.transfers if x.id == tid), None)
+        if t is None or not t.parked:
+            return False
+        t.parked = False
+        if answer is None or t.cancel_event.is_set():
+            t.error = t.connection_error or "已取消"
+            self._settle(t, "error" if t.connection_error else "cancelled")
+            return True
+        if answer == "skip":
+            self._skip_names(t, t.conflict_names)
+        t.conflict_names = []
+        t.future = self._pool.submit(self._run, t)
+        self._notify()
+        return True
+
+    @staticmethod
+    def _skip_names(t: Transfer, names):
+        """跳过: 从计划中移除这些顶层条目的全部内容."""
+        kill = set(names)
+        t.plan.skipped |= kill
+        t.plan.items = [i for i in t.plan.items if _top_of(i.rel_path) not in kill]
+        t.plan.dirs = [d for d in t.plan.dirs if _top_of(d) not in kill]
+        for d in list(t.plan.dir_modes):
+            if _top_of(d) in kill:
+                t.plan.dir_modes.pop(d, None)
+        for name in kill:
+            if t.item_status.get(name) == "pending":
+                t.item_status[name] = "skipped"
+
+    # ------------------------------------------------------------------
+    def _apply_plan(self, t: Transfer):
+        """执行计划: 建目录 → 逐项提交 → 汇总逐项结果(单项失败不牵连其他)."""
+        dst = t.dst
+        job = t.plan
+        t.total_bytes = sum(i.size for i in job.items if not i.is_link)
+        t.file_count = len(job.items)
+        t.total_known = True
+        t.phase = "transferring"
+        self._notify()
+        self._check_cancel(t)
+
+        # 目标目录本身不可用属于计划级错误(整任务失败)
+        self._mkdir_checked(dst, t.dst_dir, "目标目录")
+
+        broken = set(job.dead)
+        remaining: dict[str, int] = {}
+        for item in job.items:
+            top = _top_of(item.rel_path)
+            if top not in broken:
+                remaining[top] = remaining.get(top, 0) + 1
+        for name in list(t.item_status):
+            if t.item_status[name] == "pending" and name not in remaining:
+                t.item_status[name] = "committed"    # 空目录等无内容条目
+
+        failed: dict[str, list[str]] = {}
+        created: set[str] = set()
+        for d in job.dirs:
+            self._check_cancel(t)
+            top = _top_of(d)
+            if top in broken:
+                continue
+            path = dst.join(t.dst_dir, d)
+            try:
+                fresh = not dst.exists(path)
+            except Exception:
+                fresh = False
+            try:
+                self._mkdir_checked(dst, path, f"创建目录 {d}")
+            except BackendError as e:
+                broken.add(top)
+                failed.setdefault(top, []).append(str(e))
+                remaining[top] = 0
+                continue
+            if fresh:
+                created.add(d)
+        for item in job.items:
+            self._check_cancel(t)
+            top = _top_of(item.rel_path)
+            if top in broken:
+                continue
+            target = dst.join(t.dst_dir, item.rel_path)
+            try:
+                if item.is_link:
+                    self._copy_link(t, item, target)
+                else:
+                    self._copy_file(t, item.src_path, target)
+                    self._preserve(t, item, target)
+                t.done_files += 1
+            except CancelledError:
+                raise
+            except Exception as e:
+                failed.setdefault(top, []).append(f"{item.rel_path}: {e}")
+            remaining[top] -= 1
+
+        for name, count in remaining.items():
+            if name in broken or count > 0 or name in job.skipped:
+                continue
+            t.item_status[name] = "error" if failed.get(name) else "committed"
+        for name, msgs in failed.items():
+            summary = f"{len(msgs)} 个项目失败: " + "; ".join(msgs[:3])
+            if len(msgs) > 3:
+                summary += f"（共 {len(msgs)} 项）"
+            t.item_status[name] = "error"
+            t.item_errors[name] = summary
+            _append_error(t, f"{name}: {summary}")
+        for d in created:                       # 只调本任务新建目录的权限
+            mode = job.dir_modes.get(d)
+            if mode:
+                try:
+                    dst.set_metadata(dst.join(t.dst_dir, d), mode=mode)
+                except BackendError:
+                    t.meta_errors += 1
+        # 只有"一个字节都没提交成功"才算整体失败; 有任何成品时报告部分完成
+        if failed and not t.done_files \
+                and not any(s == "committed" for s in t.item_status.values()):
+            raise BackendError(t.error or "全部项目传输失败")
+
+    @staticmethod
+    def _check_cancel(t: Transfer):
+        if t.cancel_event.is_set():
+            raise CancelledError("已取消")
+
+    @staticmethod
+    def _preserve(t: Transfer, item, dst_path: str):
+        """权限与修改时间尽力还原; 失败只计数, 不推翻已提交的内容."""
+        if not item.mode and item.mtime is None:
+            return
+        try:
+            t.dst.set_metadata(dst_path, mode=item.mode or None,
+                               mtime=item.mtime)
+        except BackendError:
+            t.meta_errors += 1
+
+    def _copy_link(self, t: Transfer, item, dst_path: str):
+        """符号链接: 优先原样重建; 目标端不支持时退回按内容复制."""
+        src, dst = t.src, t.dst
+        target = None
+        if src.supports_links:
+            try:
+                target = src.read_link(item.src_path)
+            except BackendError as e:
+                if not dst.supports_links:
+                    raise BackendError(f"链接无法读取: {e}") from None
+        if target is not None and dst.supports_links:
+            try:
+                dst.make_symlink(target, dst_path)
+                return
+            except BackendError as e:
+                if not _UNSUPPORTED.search(str(e)):
+                    raise
+        self._copy_file(t, item.src_path, dst_path)
+
+    # ------------------------------------------------------------------
     @staticmethod
     def _mkdir_checked(backend, path, what):
         try:
@@ -525,9 +759,11 @@ class TransferManager:
         temp = t.dst.temp_path(dst_path)
         r = w = None
         committed = False
+        opened = False          # 只有真正创建过临时文件才需要清理
         try:
             r = t.src.open_read(src_path)
             w = t.dst.open_write(temp)
+            opened = True
             while not t.cancel_event.is_set():
                 chunk = r.read(CHUNK)
                 if not chunk:
@@ -549,7 +785,8 @@ class TransferManager:
         except CancelledError:
             raise
         except Exception as e:
-            raise BackendError(f"{src_path}: {e}") from None
+            # 只给出原因: 调用方负责拼上相对路径, 避免重复前缀
+            raise BackendError(str(e) or e.__class__.__name__) from None
         finally:
             for f in (w, r):
                 if f is not None:
@@ -557,8 +794,19 @@ class TransferManager:
                         f.close()
                     except Exception:
                         pass
-            if not committed:
+            if opened and not committed:
                 note = t.dst.discard_temp(temp)
                 if note:
-                    msg = f"临时文件清理失败: {note}"
-                    t.error = f"{t.error}; {msg}" if t.error else msg
+                    _append_error(t, f"临时文件清理失败: {note}")
+
+
+def _top_of(rel: str) -> str:
+    return rel.split("/", 1)[0]
+
+
+def _append_error(t: Transfer, message: str):
+    t.error = f"{t.error}; {message}" if t.error else message
+
+
+def _reason(e) -> str:
+    return str(e) or e.__class__.__name__

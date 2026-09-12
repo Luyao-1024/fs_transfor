@@ -25,6 +25,29 @@ class FileEntry:
     is_dir: bool
     perms: str = "----------"
     is_link: bool = False
+    mode: int = 0          # 原始 st_mode(0 表示未知): 供权限保留使用
+
+
+@dataclass
+class TransferItem:
+    """执行计划中的一项: 普通文件或符号链接(rel 为相对目标根的路径)."""
+    src_path: str
+    rel_path: str
+    size: int = 0
+    mode: int = 0                     # lstat 权限位(0 表示未知/不保留)
+    mtime: float | None = None
+    is_link: bool = False
+    link_target: str | None = None    # None -> 执行时再读取
+
+
+@dataclass
+class WalkPlan:
+    """传输执行计划: 目录树 + 普通文件 + 符号链接 + 未解引用的字节总量."""
+    dirs: list[str]
+    dir_modes: dict[str, int]
+    files: list[TransferItem]
+    links: list[TransferItem]
+    total: int
 
 
 def perms_str(mode) -> str:
@@ -39,6 +62,8 @@ class BaseBackend(ABC):
     dead: bool = False
 
     # ---- 基本信息 ----
+    supports_links = False   # 能否读出/创建符号链接(否则按内容复制)
+
     @property
     @abstractmethod
     def label(self) -> str:
@@ -55,7 +80,11 @@ class BaseBackend(ABC):
 
     @abstractmethod
     def stat(self, path: str) -> FileEntry | None:
-        """取单个条目; 不存在返回 None."""
+        """取单个条目(跟随链接); 不存在返回 None."""
+
+    def lstat(self, path: str) -> FileEntry | None:
+        """不跟随链接的 stat; 无链接概念的后端等同 stat()."""
+        return self.stat(path)
 
     @abstractmethod
     def exists(self, path: str) -> bool: ...
@@ -81,6 +110,20 @@ class BaseBackend(ABC):
 
     @abstractmethod
     def rename(self, old: str, new: str): ...
+
+    # ---- 链接与元数据(能力式接口: 不支持时抛 BackendError) ----
+    def read_link(self, path: str) -> str:
+        """返回符号链接的目标字符串(不解析)."""
+        raise BackendError("该位置不支持符号链接")
+
+    def make_symlink(self, target: str, path: str):
+        """在 path 创建指向 target 的符号链接."""
+        raise BackendError("该位置不支持创建符号链接")
+
+    def set_metadata(self, path: str, mode: int | None = None,
+                     mtime: float | None = None):
+        """尽力保留权限位与修改时间; 不支持时抛 BackendError."""
+        raise BackendError("该位置不支持保留权限或时间戳")
 
     # ---- 安全提交(临时文件写入, 供传输层使用; 默认实现基于 rename) ----
     def temp_path(self, target: str) -> str:
@@ -122,14 +165,26 @@ class BaseBackend(ABC):
 
     # ---- 递归收集 ----
     def walk(self, path: str, cancel_event=None):
-        """展开目录树.
+        """兼容旧接口: (相对目录列表, [(源路径, 相对路径, 大小)], 总字节数).
 
-        返回 (相对目录列表, [(绝对源路径, 相对路径, 大小)], 总字节数).
-        相对路径用于在目标端重建目录结构.
-        cancel_event: 可选 threading.Event, 置位时抛 CancelledError.
+        此视图把链接也当作普通条目给出(目标端会解引用读取内容).
+        """
+        plan = self.walk_plan(path, cancel_event)
+        files = [(i.src_path, i.rel_path, i.size) for i in plan.files]
+        files += [(i.src_path, i.rel_path, i.size) for i in plan.links]
+        return plan.dirs, files, plan.total
+
+    def walk_plan(self, path: str, cancel_event=None) -> WalkPlan:
+        """展开目录树为执行计划.
+
+        符号链接单独成组(lstat 语义, 不进入链接指向的目录); 普通文件与目录
+        带上权限位和 mtime, 供提交后尽力还原。cancel_event 置位时抛
+        CancelledError。
         """
         dirs: list[str] = []
-        files: list[tuple[str, str, int]] = []
+        dir_modes: dict[str, int] = {}
+        files: list[TransferItem] = []
+        links: list[TransferItem] = []
         total = 0
         stack = [(path, "")]
         while stack:
@@ -140,11 +195,15 @@ class BaseBackend(ABC):
                 r = f"{rel}/{e.name}" if rel else e.name
                 if e.is_dir:
                     dirs.append(r)
+                    dir_modes[r] = e.mode
                     stack.append((e.path, r))
+                elif e.is_link:
+                    links.append(TransferItem(e.path, r, 0, e.mode, e.mtime,
+                                              is_link=True))
                 else:
-                    files.append((e.path, r, e.size))
+                    files.append(TransferItem(e.path, r, e.size, e.mode, e.mtime))
                     total += e.size
-        return dirs, files, total
+        return WalkPlan(dirs, dir_modes, files, links, total)
 
     def iter_dir(self, path, cancel_event=None):
         if cancel_event is not None and cancel_event.is_set():

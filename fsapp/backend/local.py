@@ -11,6 +11,7 @@ from .base import BaseBackend, BackendError, CancelledError, FileEntry, perms_st
 
 
 def _wrap(fn, *args, **kwargs):
+    """OSError -> BackendError(消息可直接展示)."""
     try:
         return fn(*args, **kwargs)
     except OSError as e:
@@ -19,6 +20,7 @@ def _wrap(fn, *args, **kwargs):
 
 class LocalBackend(BaseBackend):
     is_local = True
+    supports_links = True
 
     def __init__(self):
         self._home = os.path.expanduser("~")
@@ -46,6 +48,7 @@ class LocalBackend(BaseBackend):
                         is_dir=stat_mod.S_ISDIR(st.st_mode),
                         perms=perms_str(st.st_mode),
                         is_link=d.is_symlink(),
+                        mode=st.st_mode,
                     ))
             return out
         return _wrap(go)
@@ -67,6 +70,26 @@ class LocalBackend(BaseBackend):
             mtime=st.st_mtime,
             is_dir=stat_mod.S_ISDIR(st.st_mode),
             perms=perms_str(st.st_mode),
+            mode=st.st_mode,
+            is_link=os.path.islink(path),
+        )
+
+    def lstat(self, path):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise BackendError(e.strerror or str(e)) from e
+        return FileEntry(
+            name=os.path.basename(path.rstrip("/")) or path,
+            path=path,
+            size=st.st_size,
+            mtime=st.st_mtime,
+            is_dir=stat_mod.S_ISDIR(st.st_mode),
+            perms=perms_str(st.st_mode),
+            mode=st.st_mode,
+            is_link=stat_mod.S_ISLNK(st.st_mode),
         )
 
     def exists(self, path):
@@ -98,6 +121,26 @@ class LocalBackend(BaseBackend):
 
     def rename(self, old, new):
         _wrap(os.replace, old, new)
+
+    # ---- 链接与元数据 ----
+    def read_link(self, path):
+        return _wrap(os.readlink, path)
+
+    def make_symlink(self, target, path):
+        if os.path.lexists(path):
+            raise BackendError(f"目标已存在, 无法创建链接: {path}")
+        _wrap(os.symlink, target, path)
+
+    def set_metadata(self, path, mode=None, mtime=None):
+        """权限与时间戳尽力还原; 链接权限不可改(平台限制), 时间不跟随链接."""
+        if mode and not os.path.islink(path):
+            _wrap(os.chmod, path, stat_mod.S_IMODE(mode))
+        if mtime is not None:
+            def touch():
+                cur = os.stat(path, follow_symlinks=False)
+                os.utime(path, ns=(cur.st_atime_ns, int(round(float(mtime) * 1e9))),
+                         follow_symlinks=False)
+            _wrap(touch)
 
     def disconnect(self):
         pass

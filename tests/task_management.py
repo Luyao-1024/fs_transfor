@@ -60,13 +60,15 @@ def main():
             task = manager.enqueue(FailSecond(), paths, LocalBackend(), str(root / "out"))
             wait(manager)
             check(task.status == "partial" and task.item_status == {
-                "a.txt": "committed", "b.txt": "error", "c.txt": "error"},
-                "中途失败保留逐项结果并显示部分完成")
-            check(task.done_files == 1 and task.file_count == 3 and task.total_known,
+                "a.txt": "committed", "b.txt": "error", "c.txt": "committed"},
+                "单项失败只影响该项，同任务其余文件继续传输")
+            check(task.done_files == 2 and task.file_count == 3 and task.total_known,
                   "文件数和已提交数量准确")
+            check(not (root / "out" / "b.txt").exists() and (root / "out" / "c.txt").exists(),
+                  "失败项不产出目标文件，成功项内容已提交")
             retry = retry_record(manager, snapshot(task), failed_only=True)
             wait(manager)
-            check(retry.src_paths == paths[1:] and retry.status == "done", "仅重试失败和未完成项")
+            check(retry.src_paths == paths[1:2] and retry.status == "done", "仅重试失败和未完成项")
             check(all((root / "out" / Path(p).name).read_text() == Path(p).name for p in paths),
                   "重试后全部文件内容正确")
             answers = []

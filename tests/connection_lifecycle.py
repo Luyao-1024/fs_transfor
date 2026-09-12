@@ -240,6 +240,8 @@ def operation_context_cases():
         is_local=True, join=lambda path, name: path + "/" + name,
         mkdir=lambda path: calls.append(("mkdir", path)),
         rename=lambda src, dst: calls.append(("rename", src, dst)),
+        normpath=lambda path: path,
+        exists=lambda path: False,      # 新建/重命名目标均不存在
         delete=lambda path: calls.append(("delete", path)))
     entry = SimpleNamespace(name="file", path="/original/file")
     pane = SimpleNamespace(backend=original, cwd="/original", window=None,

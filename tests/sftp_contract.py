@@ -1,4 +1,4 @@
-"""无 GUI SFTP 契约回归: 链接删除/关闭错误传播/严格提交.
+"""无 GUI SFTP 契约回归: 链接删除/关闭错误传播/严格提交/链接与元数据写入.
 
 用 object.__new__(SftpBackend) + 记录型 mock 构造后端, 不连真实服务器.
 运行: .venv/bin/python tests/sftp_contract.py
@@ -33,6 +33,8 @@ class MockSFTP:
     def __init__(self, entries):
         self.entries = entries
         self.calls = []
+        self.links = {}
+        self.allow_symlink = True
 
     def lstat(self, path):
         self.calls.append(("lstat", path))
@@ -70,6 +72,33 @@ class MockSFTP:
 
     def rename(self, a, b):
         self.calls.append(("rename", a, b))
+
+    def readlink(self, path):
+        self.calls.append(("readlink", path))
+        if path not in self.links:
+            raise OSError("no such link")
+        return self.links[path]
+
+    def symlink(self, source, dest):
+        self.calls.append(("symlink", source, dest))
+        if not self.allow_symlink:
+            raise OSError("not supported")
+        self.links[dest] = source
+        self.entries[dest] = stat_mod.S_IFLNK | 0o777
+
+    def chmod(self, path, mode):
+        self.calls.append(("chmod", path, mode))
+        self.entries[path] = (self.entries.get(path, 0) & ~0o7777) | mode
+
+    def utime(self, path, times):
+        self.calls.append(("utime", path, times))
+
+
+def link_capable(entries, links=None, allow_symlink=True):
+    backend = make_backend(entries)
+    backend.sftp.links = dict(links or {})
+    backend.sftp.allow_symlink = allow_symlink
+    return backend
 
 
 class FakeClient:
@@ -195,6 +224,50 @@ def main():
     be = make_backend({"/r/.tmp-4": REG})
     check(be.discard_temp("/r/.tmp-4") is None, "discard 成功返回 None")
     check(be.discard_temp("/r/.tmp-gone") == "/r/.tmp-gone", "discard 失败返回路径")
+
+    # ---- 链接与元数据: 远端读链接/建链接/权限时间 ----
+    LNK = stat_mod.S_IFLNK | 0o777
+    be = link_capable({"/r/link": LNK}, {"/r/link": "sub/target.txt"})
+    check(be.read_link("/r/link") == "sub/target.txt", "read_link 返回原始目标字符串")
+    check(("readlink", "/r/link") in be.sftp.calls, "read_link 走 lstat 语义的 readlink")
+    be.make_symlink("sub/target.txt", "/r/new")
+    check(("symlink", "sub/target.txt", "/r/new") in be.sftp.calls,
+          "make_symlink 用同一目标字符串重建链接")
+    check(be.lstat("/r/link").is_link and not be.lstat("/r/link").is_dir,
+          "lstat 报告链接而不是目录")
+    try:
+        be.read_link("/r/missing")
+        check(False, "读不到链接必须报错")
+    except BackendError as e:
+        check("读取链接失败" in str(e), f"链接读取失败可解释({e})")
+
+    be = link_capable({"/r/f": REG}, allow_symlink=False)
+    try:
+        be.make_symlink("x", "/r/f2")
+        check(False, "服务器不支持 symlink 时必须报错")
+    except BackendError as e:
+        check("not supported" in str(e),
+              f"不支持 symlink 的错误原样上报给回退判断({e})")
+
+    be = link_capable({"/r/f": REG})
+    be.set_metadata("/r/f", mode=0o750, mtime=1600000000.7)
+    check(("chmod", "/r/f", 0o750) in be.sftp.calls, "set_metadata 保留权限位")
+    check(("utime", "/r/f", (1600000000, 1600000000)) in be.sftp.calls,
+          "set_metadata 保留修改时间")
+    check(be.sftp.calls[-2][2] == 0o750, "chmod 只传权限位不含文件类型位")
+
+    class BoomSFTP(MockSFTP):
+        def chmod(self, path, mode):
+            self.calls.append(("chmod", path, mode))
+            raise OSError("permission denied")
+
+    be = link_capable({"/r/f": REG})
+    be.sftp.__class__ = BoomSFTP
+    try:
+        be.set_metadata("/r/f", mode=0o600)
+        check(False, "chmod 失败必须上报")
+    except BackendError as e:
+        check("保留权限/时间戳失败" in str(e), f"元数据失败可解释({e})")
 
     print("\nsftp_contract 全部通过 ✅")
 

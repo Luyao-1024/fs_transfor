@@ -111,7 +111,9 @@ def main():
 
     def step_drop_internal():
         win = state["win"]
-        # 先替换冲突策略, 避免 worker 线程抢在替换前弹出真实确认框(阻塞等待点击)
+        # 先替换冲突策略, 避免 worker 线程抢在替换前弹出真实确认框。
+        # 非阻塞确认钩子优先级更高, 需要先停用才会走同步钩子。
+        win.manager.ask_conflict_async = None
         win.manager.ask_overwrite = lambda names: "skip"
         value = json.dumps({"pane": state["src_pane_id"]})
         dt = win.right._internal_drop_target

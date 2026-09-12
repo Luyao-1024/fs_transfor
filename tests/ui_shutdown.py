@@ -1,4 +1,7 @@
-"""退出选择、等待确认取消和等待任务完成的真实 GTK 路径。"""
+"""退出选择、等待确认取消和等待任务完成的真实 GTK 路径。
+
+同名确认走非阻塞回调: 任务 parked 在 _conflict_dialogs 上, 退出时必须以取消收尾。
+"""
 import os
 from pathlib import Path
 import sys
@@ -78,14 +81,19 @@ def main():
         target.mkdir()
         (target / source.name).write_text("old content")
         task = win.manager.enqueue(win.local_backend, [str(source)], win.local_backend, str(target))
-        until(lambda: task.phase == "waiting" and bool(win._dialog_waiters))
+        until(lambda: task.parked and task.phase == "waiting"
+              and bool(win._conflict_dialogs))
+        check(not [t for t in win.manager.transfers
+                   if t.running and t is not task],
+              "等待确认的任务已让出工作线程")
         app.lookup_action("quit").activate(None)
         respond(win, "return")
         check(not win._closed and task.running and win.manager.accepting, "返回应用不取消原任务")
         app.lookup_action("quit").activate(None)
         respond(win, "cancel")
         until(lambda: win._closed)
-        check(task.status == "cancelled" and not win._dialog_waiters and not win._tick_id,
+        check(task.status == "cancelled" and not win._conflict_dialogs
+              and not win._dialog_waiters and not win._tick_id,
               "菜单退出取消覆盖等待，并释放任务、对话框和定时器")
         check((target / source.name).read_text() == "old content", "取消退出保留原目标内容")
 

@@ -13,7 +13,13 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Run the application with `./run.sh`. This project has no compilation step. Run the headless core suite with `.venv/bin/python tests/selftest.py`. UI suites are individual executable scripts, for example `.venv/bin/python tests/ui_smoke.py`; run all `tests/ui_*.py` scripts before merging UI, connection, or transfer changes. UI tests briefly open windows and therefore require a graphical display.
+Run the application with `./run.sh`. This project has no compilation step. Run every headless suite (no display needed): `tests/selftest.py`,
+`tests/transfer_safety.py`, `tests/sftp_contract.py`, `tests/connection_lifecycle.py`,
+`tests/task_management.py`, `tests/hostkey_policy.py` and `tests/transfer_resilience.py`.
+UI suites are individual executable scripts, for example `.venv/bin/python tests/ui_smoke.py`;
+run all `tests/ui_*.py` scripts before merging UI, connection, or transfer changes.
+Host-key tests point `HOME` at a temporary directory; never exercise them against the
+real `~/.ssh/known_hosts`. UI tests briefly open windows and therefore require a graphical display.
 
 ## Coding Style & Naming Conventions
 
